@@ -1,0 +1,4 @@
+Pillow
+PySide6
+pyinstaller
+python-vlc

@@ -1,0 +1,33 @@
+{
+  "last_folder": "",
+  "view_mode": "details",
+  "sort_mode": "name_asc",
+  "viewer_mode": "single",
+  "viewer_step": "page",
+  "default_fit": "fit_height",
+  "zoom_locked": true,
+  "theme": "dark",
+  "quick_paths": [],
+  "geometry": {},
+  "shortcuts": {
+    "open_viewer": ["Return"],
+    "toggle_fullscreen": ["F11", "MouseMiddle"],
+    "next_media": ["PageDown", "WheelDown"],
+    "previous_media": ["PageUp", "WheelUp"],
+    "first_media": ["Home"],
+    "last_media": ["End"],
+    "zoom_in": ["Ctrl++"],
+    "zoom_out": ["Ctrl+-"],
+    "fit_height": ["H"],
+    "fit_width": ["W"],
+    "actual_size": ["1"],
+    "toggle_zoom_lock": ["L"],
+    "toggle_play": [],
+    "rotate_right": ["R"],
+    "rotate_left": ["Shift+R"],
+    "back": ["Alt+Left"],
+    "forward": ["Alt+Right"],
+    "rename": ["F2"],
+    "delete": ["Delete"]
+  }
+}

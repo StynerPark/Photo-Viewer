@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+*.spec
+
+settings.json
+.thumb_cache/
+
+vlc/
+
+.venv/
+venv/
+env/
+
