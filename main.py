@@ -310,6 +310,8 @@ class MediaItem:
 class ThumbList(QListWidget):
     openRequested = Signal(str)
     previewRequested = Signal(str)
+    copyRequested = Signal()
+    deleteRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -321,6 +323,12 @@ class ThumbList(QListWidget):
         self.itemSelectionChanged.connect(self._preview_selected)
         self.icon_provider = QFileIconProvider()
         self.setSpacing(8)
+        self.setStyleSheet("""
+            QListWidget { background: #050505; }
+            QListWidget::item { background: #050505; color: #f0f0f0; padding: 4px; }
+            QListWidget::item:selected { background: #5a1470; color: #ffffff; border: 1px solid #9d6fff; }
+            QListWidget::item:hover { background: #303030; }
+        """)
 
     def set_view_mode_name(self, mode):
         if mode == "list":
@@ -360,11 +368,22 @@ class ThumbList(QListWidget):
     def startDrag(self, supported_actions):
         super().startDrag(supported_actions)
 
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Copy):
+            self.copyRequested.emit()
+            return
+        if event.key() == Qt.Key_Delete:
+            self.deleteRequested.emit()
+            return
+        super().keyPressEvent(event)
+
 
 class DetailsTable(QTableWidget):
     openRequested = Signal(str)
     previewRequested = Signal(str)
     sortedRequested = Signal(str, bool)
+    copyRequested = Signal()
+    deleteRequested = Signal()
 
     HEADERS = [
         "Filename",
@@ -408,6 +427,9 @@ class DetailsTable(QTableWidget):
         self.horizontalHeader().sectionClicked.connect(self._sort_clicked)
         self.sort_column = 0
         self.sort_ascending = True
+        self.setStyleSheet("""
+            QTableWidget::item:selected { background: #5a1470; color: #ffffff; }
+        """)
 
     def load_entries(self, entries, icon_provider, make_icon):
         self.setRowCount(0)
@@ -470,6 +492,15 @@ class DetailsTable(QTableWidget):
         self.horizontalHeader().setSortIndicator(column, Qt.AscendingOrder if self.sort_ascending else Qt.DescendingOrder)
         self.horizontalHeader().setSortIndicatorShown(True)
         self.sortedRequested.emit(self.SORT_KEYS.get(column, "name"), self.sort_ascending)
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Copy):
+            self.copyRequested.emit()
+            return
+        if event.key() == Qt.Key_Delete:
+            self.deleteRequested.emit()
+            return
+        super().keyPressEvent(event)
 
 
 class PreviewPanel(QLabel):
@@ -1733,6 +1764,8 @@ class MainWindow(QMainWindow):
         self.list.openRequested.connect(self.open_path)
         self.list.previewRequested.connect(self.preview.show_path)
         self.list.customContextMenuRequested.connect(self.list_menu)
+        self.list.copyRequested.connect(self.copy_selected)
+        self.list.deleteRequested.connect(self.delete_selected)
         self.list.installEventFilter(self)
         self.list.viewport().installEventFilter(self)
 
@@ -1742,6 +1775,8 @@ class MainWindow(QMainWindow):
         self.details.sortedRequested.connect(self.set_sort_from_header)
         self.details.setContextMenuPolicy(Qt.CustomContextMenu)
         self.details.customContextMenuRequested.connect(self.details_menu)
+        self.details.copyRequested.connect(self.copy_selected)
+        self.details.deleteRequested.connect(self.delete_selected)
         self.details.installEventFilter(self)
         self.details.viewport().installEventFilter(self)
         self.tree.installEventFilter(self)
@@ -1833,7 +1868,8 @@ class MainWindow(QMainWindow):
         if self.settings.get("theme", "dark") == "light":
             self.setStyleSheet("""
                 QMainWindow, QWidget { background: #f2f2f2; color: #161616; }
-                QTreeView, QListWidget, QTableWidget { background: #ffffff; color: #151515; selection-background-color: #7d4aa3; selection-color: white; }
+            QTreeView, QListWidget, QTableWidget { background: #ffffff; color: #151515; selection-background-color: #7d4aa3; selection-color: white; }
+            QListWidget::item:selected, QTableWidget::item:selected { background: #7d4aa3; color: white; border: 1px solid #ad78d1; }
                 QHeaderView::section { background: #e2e2e2; color: #151515; border: 1px solid #c8c8c8; padding: 4px; }
                 QLineEdit { background: #ffffff; color: #151515; border: 1px solid #b8b8b8; padding: 5px 8px; }
                 QToolButton, QPushButton, QComboBox { background: #e4e4e4; color: #151515; border: 1px solid #b8b8b8; padding: 4px 9px; }
@@ -1843,7 +1879,8 @@ class MainWindow(QMainWindow):
         else:
             self.setStyleSheet("""
                 QMainWindow, QWidget { background: #1e1e1e; color: #f0f0f0; }
-                QTreeView, QListWidget, QTableWidget { background: #242424; color: #f0f0f0; selection-background-color: #5a1470; selection-color: white; }
+            QTreeView, QListWidget, QTableWidget { background: #242424; color: #f0f0f0; selection-background-color: #5a1470; selection-color: white; }
+            QListWidget::item:selected, QTableWidget::item:selected { background: #5a1470; color: white; border: 1px solid #9d6fff; }
                 QHeaderView::section { background: #3a3a3a; color: #f0f0f0; border: 1px solid #555; padding: 4px; }
                 QLineEdit { background: #262626; color: #f0f0f0; border: 1px solid #444; padding: 5px 8px; }
                 QToolButton, QPushButton, QComboBox { background: #3a3a3a; color: #f0f0f0; border: 1px solid #555; padding: 4px 9px; }
@@ -2230,9 +2267,12 @@ class MainWindow(QMainWindow):
             return self.style().standardIcon(QStyle.SP_MediaPlay)
         try:
             with Image.open(entry.path) as img:
+                img = img.convert("RGBA")
                 img.thumbnail((192, 192))
+                canvas = Image.new("RGBA", (192, 192), (0, 0, 0, 255))
+                canvas.alpha_composite(img, ((192 - img.width) // 2, (192 - img.height) // 2))
                 data = BytesIO()
-                img.convert("RGBA").save(data, format="PNG")
+                canvas.save(data, format="PNG")
                 pix = QPixmap()
                 pix.loadFromData(data.getvalue(), "PNG")
                 return QIcon(pix)
@@ -2358,7 +2398,10 @@ class MainWindow(QMainWindow):
     def selected_paths(self):
         if self.view_combo.currentText() == "details":
             return self.details.selected_paths()
-        return [Path(i.data(Qt.UserRole)) for i in self.list.selectedItems()]
+        items = self.list.selectedItems()
+        if not items and self.list.currentItem():
+            items = [self.list.currentItem()]
+        return [Path(i.data(Qt.UserRole)) for i in items]
 
     def copy_selected(self):
         if self.main_stack.currentWidget() != self.explorer_root:
