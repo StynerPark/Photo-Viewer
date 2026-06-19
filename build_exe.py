@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parent
 PYTHON = Path(sys.executable)
 DIST = ROOT / "dist" / "PortableMediaViewer"
 VLC_SRC = ROOT / "vlc"
+ICON = ROOT / "app.ico"
 
 
 def main():
@@ -20,6 +21,8 @@ def main():
         "--noconsole",
         "--name",
         "PortableMediaViewer",
+        "--icon",
+        str(ICON),
         str(ROOT / "main.py"),
     ], cwd=ROOT)
     if VLC_SRC.exists():
