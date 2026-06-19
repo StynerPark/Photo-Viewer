@@ -28,7 +28,7 @@ if not DEFAULT_START_FOLDER.exists():
     DEFAULT_START_FOLDER = Path.home()
 
 from PIL import Image
-from PySide6.QtCore import QAbstractNativeEventFilter, QDir, QEvent, QFileInfo, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QDir, QEvent, QFileInfo, QFileSystemWatcher, QMimeData, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QMovie, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -637,6 +637,7 @@ class ViewerWindow(QMainWindow):
     closed = Signal()
     exitRequested = Signal()
     deleteRequested = Signal(str)
+    copyRequested = Signal(str)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -697,6 +698,9 @@ class ViewerWindow(QMainWindow):
         overlay_layout = QHBoxLayout(self.viewer_overlay)
         overlay_layout.setContentsMargins(8, 6, 8, 6)
         overlay_layout.setSpacing(6)
+        self.top_filename_label = QLabel("")
+        self.top_filename_label.setMinimumWidth(180)
+        overlay_layout.addWidget(self.top_filename_label)
         overlay_layout.addWidget(QLabel("Mode"))
         self.mode_btn = QToolButton()
         self.mode_btn.setPopupMode(QToolButton.InstantPopup)
@@ -730,6 +734,13 @@ class ViewerWindow(QMainWindow):
         self.update_manual_zoom_controls()
         self.viewer_overlay.hide()
 
+        self.corner_filename_label = QLabel("", self.central)
+        self.corner_filename_label.setObjectName("cornerFilenameLabel")
+        self.corner_filename_label.setStyleSheet("""
+            #cornerFilenameLabel { background: rgba(12,14,18,210); color: white; border: 1px solid rgba(255,255,255,55); border-radius: 5px; padding: 6px 10px; }
+        """)
+        self.corner_filename_label.hide()
+
         self.rotation_overlay = QFrame(self.central)
         self.rotation_overlay.setObjectName("rotationOverlay")
         self.rotation_overlay.setStyleSheet("""
@@ -739,6 +750,9 @@ class ViewerWindow(QMainWindow):
         rotate_layout = QHBoxLayout(self.rotation_overlay)
         rotate_layout.setContentsMargins(8, 6, 8, 6)
         rotate_layout.setSpacing(6)
+        self.rotation_filename_label = QLabel("")
+        self.rotation_filename_label.setMinimumWidth(180)
+        rotate_layout.addWidget(self.rotation_filename_label)
         self.rotate_left_btn = QPushButton("↶")
         self.rotate_left_btn.setToolTip("Rotate left 90 degrees")
         self.rotate_left_btn.clicked.connect(self.rotate_left)
@@ -765,6 +779,8 @@ class ViewerWindow(QMainWindow):
         video_layout = QHBoxLayout(self.video_overlay)
         video_layout.setContentsMargins(8, 6, 8, 6)
         video_layout.setSpacing(6)
+        self.video_filename_label = QLabel("")
+        self.video_filename_label.setMinimumWidth(180)
         self.play_btn = QPushButton("Play/Pause")
         self.play_btn.clicked.connect(self.toggle_play)
         self.stop_btn = QPushButton("Stop")
@@ -780,6 +796,7 @@ class ViewerWindow(QMainWindow):
         self.volume_slider.setValue(80)
         self.volume_slider.setFixedWidth(90)
         self.volume_slider.valueChanged.connect(self.set_video_volume)
+        video_layout.addWidget(self.video_filename_label)
         video_layout.addWidget(self.play_btn)
         video_layout.addWidget(self.stop_btn)
         video_layout.addWidget(self.time_label)
@@ -989,7 +1006,26 @@ class ViewerWindow(QMainWindow):
         else:
             title_name = self.items[self.index].name
         self.setWindowTitle(f"{APP_NAME} - {self.index + 1}/{len(self.items)} - {title_name}")
+        self.update_filename_labels()
         self.position_overlays()
+
+    def current_file_name(self):
+        if not self.items:
+            return ""
+        if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+            return f"webtoon ({len([p for p in self.items if is_image(p)])} images)"
+        return self.items[self.index].name
+
+    def update_filename_labels(self):
+        name = self.current_file_name()
+        for label in (
+            self.top_filename_label,
+            self.rotation_filename_label,
+            self.video_filename_label,
+            self.corner_filename_label,
+        ):
+            label.setText(name)
+            label.setToolTip(name)
 
     def schedule_image_update(self):
         QTimer.singleShot(0, self.update_image_labels)
@@ -1134,6 +1170,9 @@ class ViewerWindow(QMainWindow):
             video_w,
             video_h,
         )
+        self.corner_filename_label.adjustSize()
+        self.corner_filename_label.setGeometry(margin, margin, self.corner_filename_label.sizeHint().width(), self.corner_filename_label.sizeHint().height())
+        self.corner_filename_label.setVisible(bool(self.current_file_name()) and not self.window().isFullScreen())
         if getattr(self, "current_is_video", False):
             hot_h = max(90, video_h + margin * 2)
             self.input_layer.setGeometry(0, max(0, self.central.height() - hot_h), self.central.width(), hot_h)
@@ -1144,6 +1183,7 @@ class ViewerWindow(QMainWindow):
         self.viewer_overlay.raise_()
         self.rotation_overlay.raise_()
         self.video_overlay.raise_()
+        self.corner_filename_label.raise_()
 
     def show_overlays(self, pos=None):
         self.position_overlays()
@@ -1196,6 +1236,9 @@ class ViewerWindow(QMainWindow):
         self.exitRequested.emit()
 
     def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Copy):
+            self.copy_current()
+            return
         if event.key() == Qt.Key_Escape and self.window().isFullScreen():
             self.window().showNormal()
         elif event.key() == Qt.Key_Escape:
@@ -1217,6 +1260,9 @@ class ViewerWindow(QMainWindow):
         if not self.is_active_viewer():
             return super().eventFilter(obj, event)
         if event.type() == QEvent.KeyPress:
+            if event.matches(QKeySequence.Copy):
+                self.copy_current()
+                return True
             if event.key() == Qt.Key_PageDown:
                 if self.scroll_webtoon_page(1):
                     return True
@@ -1313,6 +1359,11 @@ class ViewerWindow(QMainWindow):
         if not self.items:
             return
         self.deleteRequested.emit(str(self.items[self.index]))
+
+    def copy_current(self):
+        if not self.items:
+            return
+        self.copyRequested.emit(str(self.items[self.index]))
 
     def remove_current_after_delete(self, deleted_path):
         deleted_path = str(deleted_path)
@@ -1624,6 +1675,11 @@ class MainWindow(QMainWindow):
         self.tabs = []
         self.current_tab = 0
         self._loading_tab = False
+        self.folder_watcher = QFileSystemWatcher(self)
+        self.folder_watcher.directoryChanged.connect(self.on_watched_folder_changed)
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.timeout.connect(self.reload_current_if_available)
         self.icon_provider = QFileIconProvider()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
@@ -2072,6 +2128,7 @@ class MainWindow(QMainWindow):
         model_index = self.tree_model.index(str(folder))
         if model_index.isValid():
             self.tree.setCurrentIndex(model_index)
+        self.watch_current_folder()
         self.populate_list()
         self.update_current_tab()
         return True
@@ -2192,6 +2249,25 @@ class MainWindow(QMainWindow):
     def reload_current(self):
         self.populate_list()
 
+    def watch_current_folder(self):
+        try:
+            watched = self.folder_watcher.directories()
+            if watched:
+                self.folder_watcher.removePaths(watched)
+            if not self.virtual_unc_server and self.safe_is_dir(self.current_folder):
+                self.folder_watcher.addPath(str(self.current_folder))
+        except Exception:
+            pass
+
+    def on_watched_folder_changed(self, path):
+        if Path(path) == self.current_folder:
+            self.refresh_timer.start(250)
+
+    def reload_current_if_available(self):
+        if self.safe_is_dir(self.current_folder):
+            self.populate_list()
+            self.watch_current_folder()
+
     def go_to_typed_path(self):
         text = self.path_edit.text().strip().strip('"')
         if text:
@@ -2284,6 +2360,16 @@ class MainWindow(QMainWindow):
             return self.details.selected_paths()
         return [Path(i.data(Qt.UserRole)) for i in self.list.selectedItems()]
 
+    def copy_selected(self):
+        if self.main_stack.currentWidget() != self.explorer_root:
+            return
+        focus = QApplication.focusWidget()
+        if focus in (self.path_edit, getattr(self, "quick_search", None)):
+            return
+        paths = self.selected_paths()
+        if paths:
+            copy_files_to_clipboard(paths)
+
     def open_selected_viewer(self):
         if QApplication.focusWidget() is self.path_edit:
             self.go_to_typed_path()
@@ -2306,12 +2392,18 @@ class MainWindow(QMainWindow):
         self.viewer = ViewerWindow(self.settings, self)
         self.viewer.exitRequested.connect(self.exit_viewer_mode)
         self.viewer.deleteRequested.connect(self.delete_from_viewer)
+        self.viewer.copyRequested.connect(self.copy_from_viewer)
         self.viewer.load(self.media_paths, idx)
         self.main_stack.addWidget(self.viewer)
         self.nav_toolbar.hide()
         self.main_stack.setCurrentWidget(self.viewer)
         self.showFullScreen()
         self.viewer.setFocus()
+
+    def copy_from_viewer(self, path):
+        copy_files_to_clipboard([Path(path)])
+        if self.viewer:
+            self.viewer.setFocus()
 
     def delete_from_viewer(self, path):
         if not self.viewer:
@@ -2324,7 +2416,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Delete",
-            f"Move this file to recycle bin?\n\n{path.name}",
+            f"Move this file to recycle bin?\n\nFile: {path.name}\nPath: {path}",
         )
         if answer != QMessageBox.Yes:
             self.viewer.setFocus()
@@ -2413,6 +2505,9 @@ class MainWindow(QMainWindow):
                     self.go_forward()
                     return True
             if event.type() == QEvent.KeyPress:
+                if event.matches(QKeySequence.Copy):
+                    self.copy_selected()
+                    return True
                 if event.key() == Qt.Key_Backspace:
                     self.go_back()
                     return True
@@ -2438,7 +2533,9 @@ class MainWindow(QMainWindow):
         paths = self.selected_paths()
         if not paths:
             return
-        answer = QMessageBox.question(self, "Delete", f"Move {len(paths)} item(s) to recycle bin if possible?")
+        names = "\n".join(str(path) for path in paths[:10])
+        more = "" if len(paths) <= 10 else f"\n... and {len(paths) - 10} more"
+        answer = QMessageBox.question(self, "Delete", f"Move {len(paths)} item(s) to recycle bin if possible?\n\n{names}{more}")
         if answer != QMessageBox.Yes:
             return
         for path in paths:
@@ -2512,6 +2609,16 @@ def send_to_recycle_bin(path):
         send2trash(str(path))
     except Exception:
         raise
+
+
+def copy_files_to_clipboard(paths):
+    existing = [Path(path) for path in paths if Path(path).exists()]
+    if not existing:
+        return
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(path)) for path in existing])
+    mime.setText("\n".join(str(path) for path in existing))
+    QApplication.clipboard().setMimeData(mime)
 
 
 def main():
