@@ -312,6 +312,7 @@ class ThumbList(QListWidget):
     previewRequested = Signal(str)
     copyRequested = Signal()
     deleteRequested = Signal()
+    pasteRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -372,6 +373,9 @@ class ThumbList(QListWidget):
         if event.matches(QKeySequence.Copy):
             self.copyRequested.emit()
             return
+        if event.matches(QKeySequence.Paste):
+            self.pasteRequested.emit()
+            return
         if event.key() == Qt.Key_Delete:
             self.deleteRequested.emit()
             return
@@ -384,6 +388,7 @@ class DetailsTable(QTableWidget):
     sortedRequested = Signal(str, bool)
     copyRequested = Signal()
     deleteRequested = Signal()
+    pasteRequested = Signal()
 
     HEADERS = [
         "Filename",
@@ -496,6 +501,9 @@ class DetailsTable(QTableWidget):
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.Copy):
             self.copyRequested.emit()
+            return
+        if event.matches(QKeySequence.Paste):
+            self.pasteRequested.emit()
             return
         if event.key() == Qt.Key_Delete:
             self.deleteRequested.emit()
@@ -669,6 +677,7 @@ class ViewerWindow(QMainWindow):
     exitRequested = Signal()
     deleteRequested = Signal(str)
     copyRequested = Signal(str)
+    pasteRequested = Signal()
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -1270,6 +1279,9 @@ class ViewerWindow(QMainWindow):
         if event.matches(QKeySequence.Copy):
             self.copy_current()
             return
+        if event.matches(QKeySequence.Paste):
+            self.pasteRequested.emit()
+            return
         if event.key() == Qt.Key_Escape and self.window().isFullScreen():
             self.window().showNormal()
         elif event.key() == Qt.Key_Escape:
@@ -1293,6 +1305,9 @@ class ViewerWindow(QMainWindow):
         if event.type() == QEvent.KeyPress:
             if event.matches(QKeySequence.Copy):
                 self.copy_current()
+                return True
+            if event.matches(QKeySequence.Paste):
+                self.pasteRequested.emit()
                 return True
             if event.key() == Qt.Key_PageDown:
                 if self.scroll_webtoon_page(1):
@@ -1766,6 +1781,7 @@ class MainWindow(QMainWindow):
         self.list.customContextMenuRequested.connect(self.list_menu)
         self.list.copyRequested.connect(self.copy_selected)
         self.list.deleteRequested.connect(self.delete_selected)
+        self.list.pasteRequested.connect(self.paste_from_clipboard)
         self.list.installEventFilter(self)
         self.list.viewport().installEventFilter(self)
 
@@ -1777,6 +1793,7 @@ class MainWindow(QMainWindow):
         self.details.customContextMenuRequested.connect(self.details_menu)
         self.details.copyRequested.connect(self.copy_selected)
         self.details.deleteRequested.connect(self.delete_selected)
+        self.details.pasteRequested.connect(self.paste_from_clipboard)
         self.details.installEventFilter(self)
         self.details.viewport().installEventFilter(self)
         self.tree.installEventFilter(self)
@@ -2413,6 +2430,51 @@ class MainWindow(QMainWindow):
         if paths:
             copy_files_to_clipboard(paths)
 
+    def paste_from_clipboard(self):
+        active_viewer = bool(self.viewer and self.main_stack.currentWidget() == self.viewer)
+        active_explorer = self.main_stack.currentWidget() == self.explorer_root
+        if not active_explorer and not active_viewer:
+            return
+        focus = QApplication.focusWidget()
+        if active_explorer and focus in (self.path_edit, getattr(self, "quick_search", None)):
+            return
+        if self.virtual_unc_server or not self.safe_is_dir(self.current_folder):
+            return
+        urls = QApplication.clipboard().mimeData().urls()
+        sources = [Path(url.toLocalFile()) for url in urls if url.isLocalFile()]
+        if not sources:
+            return
+        copied = []
+        for source in sources:
+            if not source.exists():
+                continue
+            try:
+                target = unique_copy_target(self.current_folder / source.name)
+                if source.is_dir() and path_contains(source, target):
+                    QMessageBox.warning(self, "Paste failed", f"Cannot paste a folder into itself:\n{source}")
+                    continue
+                if source.is_dir():
+                    shutil.copytree(source, target)
+                else:
+                    shutil.copy2(source, target)
+                copied.append(str(target))
+            except Exception as exc:
+                QMessageBox.warning(self, "Paste failed", f"Could not paste:\n{source}\n\n{exc}")
+                break
+        self.populate_list()
+        if active_viewer and self.viewer:
+            current = str(self.viewer.items[self.viewer.index]) if self.viewer.items else ""
+            self.viewer.items = [Path(p) for p in self.media_paths]
+            if self.viewer.items:
+                if current in self.media_paths:
+                    self.viewer.index = self.media_paths.index(current)
+                else:
+                    self.viewer.index = min(self.viewer.index, len(self.viewer.items) - 1)
+                self.viewer.show_current(reset=False)
+            self.viewer.setFocus()
+        elif copied:
+            self.select_path(copied[0])
+
     def open_selected_viewer(self):
         if QApplication.focusWidget() is self.path_edit:
             self.go_to_typed_path()
@@ -2436,6 +2498,7 @@ class MainWindow(QMainWindow):
         self.viewer.exitRequested.connect(self.exit_viewer_mode)
         self.viewer.deleteRequested.connect(self.delete_from_viewer)
         self.viewer.copyRequested.connect(self.copy_from_viewer)
+        self.viewer.pasteRequested.connect(self.paste_from_clipboard)
         self.viewer.load(self.media_paths, idx)
         self.main_stack.addWidget(self.viewer)
         self.nav_toolbar.hide()
@@ -2551,6 +2614,9 @@ class MainWindow(QMainWindow):
                 if event.matches(QKeySequence.Copy):
                     self.copy_selected()
                     return True
+                if event.matches(QKeySequence.Paste):
+                    self.paste_from_clipboard()
+                    return True
                 if event.key() == Qt.Key_Backspace:
                     self.go_back()
                     return True
@@ -2662,6 +2728,28 @@ def copy_files_to_clipboard(paths):
     mime.setUrls([QUrl.fromLocalFile(str(path)) for path in existing])
     mime.setText("\n".join(str(path) for path in existing))
     QApplication.clipboard().setMimeData(mime)
+
+
+def unique_copy_target(target):
+    target = Path(target)
+    if not target.exists():
+        return target
+    parent = target.parent
+    stem = target.stem
+    suffix = target.suffix
+    for index in range(1, 10000):
+        candidate = parent / f"{stem} ({index}){suffix}"
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"Too many duplicate names for {target.name}")
+
+
+def path_contains(parent, child):
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def main():
