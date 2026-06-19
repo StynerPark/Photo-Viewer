@@ -636,6 +636,7 @@ class ViewerMouseWheelHook:
 class ViewerWindow(QMainWindow):
     closed = Signal()
     exitRequested = Signal()
+    deleteRequested = Signal(str)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -1235,6 +1236,9 @@ class ViewerWindow(QMainWindow):
             if event.key() == Qt.Key_Space:
                 self.handle_space()
                 return True
+            if event.key() == Qt.Key_Delete:
+                self.request_delete_current()
+                return True
             if event.key() == Qt.Key_Escape:
                 if self.window().isFullScreen():
                     self.window().showNormal()
@@ -1304,6 +1308,21 @@ class ViewerWindow(QMainWindow):
             self.toggle_play()
         else:
             self.next_media_wrap()
+
+    def request_delete_current(self):
+        if not self.items:
+            return
+        self.deleteRequested.emit(str(self.items[self.index]))
+
+    def remove_current_after_delete(self, deleted_path):
+        deleted_path = str(deleted_path)
+        self.stop_media()
+        self.items = [p for p in self.items if str(p) != deleted_path]
+        if not self.items:
+            self.exitRequested.emit()
+            return
+        self.index = min(self.index, len(self.items) - 1)
+        self.show_current(reset=not self.zoom_locked)
 
     def previous_media(self):
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
@@ -2286,12 +2305,41 @@ class MainWindow(QMainWindow):
             idx = 0
         self.viewer = ViewerWindow(self.settings, self)
         self.viewer.exitRequested.connect(self.exit_viewer_mode)
+        self.viewer.deleteRequested.connect(self.delete_from_viewer)
         self.viewer.load(self.media_paths, idx)
         self.main_stack.addWidget(self.viewer)
         self.nav_toolbar.hide()
         self.main_stack.setCurrentWidget(self.viewer)
         self.showFullScreen()
         self.viewer.setFocus()
+
+    def delete_from_viewer(self, path):
+        if not self.viewer:
+            return
+        path = Path(path)
+        if not path.exists():
+            self.viewer.remove_current_after_delete(str(path))
+            self.populate_list()
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete",
+            f"Move this file to recycle bin?\n\n{path.name}",
+        )
+        if answer != QMessageBox.Yes:
+            self.viewer.setFocus()
+            return
+        try:
+            send_to_recycle_bin(path)
+        except Exception:
+            QMessageBox.warning(self, "Delete failed", f"Could not move to recycle bin:\n{path}")
+            self.viewer.setFocus()
+            return
+        self.media_paths = [p for p in self.media_paths if p != str(path)]
+        self.viewer.remove_current_after_delete(str(path))
+        self.populate_list()
+        if self.viewer:
+            self.viewer.setFocus()
 
     def exit_viewer_mode(self):
         if not self.viewer:

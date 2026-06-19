@@ -2,3 +2,4 @@ Pillow
 PySide6
 pyinstaller
 python-vlc
+send2trash
