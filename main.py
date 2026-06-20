@@ -723,6 +723,9 @@ class ViewerWindow(QMainWindow):
         self.central.setFocusPolicy(Qt.StrongFocus)
         self.video_frame.installEventFilter(self)
         self.central.installEventFilter(self)
+        self.delete_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), self)
+        self.delete_shortcut.setContext(Qt.ApplicationShortcut)
+        self.delete_shortcut.activated.connect(self.request_delete_current)
 
         self.overlay_timer = QTimer(self)
         self.overlay_timer.setSingleShot(True)
@@ -1296,6 +1299,8 @@ class ViewerWindow(QMainWindow):
             self.last_media()
         elif event.key() == Qt.Key_Space:
             self.handle_space()
+        elif event.key() == Qt.Key_Delete:
+            self.request_delete_current()
         else:
             super().keyPressEvent(event)
 
@@ -2533,10 +2538,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Delete failed", f"Could not move to recycle bin:\n{path}")
             self.viewer.setFocus()
             return
-        self.media_paths = [p for p in self.media_paths if p != str(path)]
         self.viewer.remove_current_after_delete(str(path))
         self.populate_list()
         if self.viewer:
+            self.viewer.items = [Path(p) for p in self.media_paths]
+            if self.viewer.items:
+                self.viewer.index = min(self.viewer.index, len(self.viewer.items) - 1)
+                self.viewer.show_current(reset=False)
+            else:
+                self.exit_viewer_mode()
+                return
             self.viewer.setFocus()
 
     def exit_viewer_mode(self):
