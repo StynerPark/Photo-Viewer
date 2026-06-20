@@ -558,6 +558,7 @@ class ViewerNativeInputFilter(QAbstractNativeEventFilter):
     VK_NEXT = 0x22
     VK_END = 0x23
     VK_HOME = 0x24
+    VK_DELETE = 0x2E
 
     class MSG(ctypes.Structure):
         _fields_ = [
@@ -576,7 +577,9 @@ class ViewerNativeInputFilter(QAbstractNativeEventFilter):
 
     def nativeEventFilter(self, event_type, message):
         viewer = getattr(self.main_window, "viewer", None)
-        if not viewer or not viewer.is_active_viewer():
+        if not viewer:
+            return False, 0
+        if hasattr(self.main_window, "main_stack") and self.main_window.main_stack.currentWidget() is not viewer:
             return False, 0
         try:
             msg = self.MSG.from_address(int(message))
@@ -596,6 +599,9 @@ class ViewerNativeInputFilter(QAbstractNativeEventFilter):
                 return True, 0
             if key == self.VK_END:
                 QTimer.singleShot(0, viewer.last_media)
+                return True, 0
+            if key == self.VK_DELETE:
+                QTimer.singleShot(0, self.main_window.handle_delete_shortcut)
                 return True, 0
 
         if msg.message == self.WM_MOUSEWHEEL:
@@ -2529,14 +2535,6 @@ class MainWindow(QMainWindow):
         if not path.exists():
             self.viewer.remove_current_after_delete(str(path))
             self.populate_list()
-            return
-        answer = QMessageBox.question(
-            self,
-            "Delete",
-            f"Move this file to recycle bin?\n\nFile: {path.name}\nPath: {path}",
-        )
-        if answer != QMessageBox.Yes:
-            self.viewer.setFocus()
             return
         try:
             send_to_recycle_bin(path)
