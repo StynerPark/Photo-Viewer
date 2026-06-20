@@ -2050,7 +2050,7 @@ class MainWindow(QMainWindow):
             "back": self.go_back,
             "forward": self.go_forward,
             "rename": self.rename_selected,
-            "delete": self.delete_selected,
+            "delete": self.handle_delete_shortcut,
         }
         for name, callback in shortcut_map.items():
             for seq in self.settings.get("shortcuts", {}).get(name, []):
@@ -2515,6 +2515,12 @@ class MainWindow(QMainWindow):
         copy_files_to_clipboard([Path(path)])
         if self.viewer:
             self.viewer.setFocus()
+
+    def handle_delete_shortcut(self):
+        if self.viewer and self.main_stack.currentWidget() == self.viewer:
+            self.viewer.request_delete_current()
+        else:
+            self.delete_selected()
 
     def delete_from_viewer(self, path):
         if not self.viewer:
