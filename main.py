@@ -28,6 +28,7 @@ if not DEFAULT_START_FOLDER.exists():
     DEFAULT_START_FOLDER = Path.home()
 
 from PIL import Image
+from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QAbstractNativeEventFilter, QDir, QEvent, QFileInfo, QFileSystemWatcher, QMimeData, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QMovie, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
@@ -707,6 +708,11 @@ class ViewerWindow(QMainWindow):
         self.video_finished = False
         self.video_stopped_by_user = False
         self.webtoon_scroll = None
+        self.animated_image_reader = None
+        self.animated_image_frame_count = 0
+        self.animated_image_index = 0
+        self.animated_image_label = None
+        self.animated_image_path = None
 
         self.setWindowTitle(APP_NAME + " - Viewer")
         self.setMinimumSize(900, 640)
@@ -855,6 +861,8 @@ class ViewerWindow(QMainWindow):
         self.video_overlay.hide()
         self.video_timer = QTimer(self)
         self.video_timer.timeout.connect(self.update_video_controls)
+        self.animated_image_timer = QTimer(self)
+        self.animated_image_timer.timeout.connect(self.advance_animated_image)
         self.input_layer = QWidget(self.central)
         self.input_layer.setMouseTracking(True)
         self.input_layer.setStyleSheet("background: transparent;")
@@ -1104,6 +1112,7 @@ class ViewerWindow(QMainWindow):
 
     def stop_media(self):
         self.movie = None
+        self.stop_animated_image()
         self.video_stopped_by_user = True
         self.video_finished = False
         if hasattr(self, "video_timer"):
@@ -1119,15 +1128,83 @@ class ViewerWindow(QMainWindow):
             self.seek_slider.blockSignals(False)
             self.time_label.setText("00:00 / 00:00")
 
+    def stop_animated_image(self):
+        if hasattr(self, "animated_image_timer"):
+            self.animated_image_timer.stop()
+        if self.animated_image_reader is not None:
+            try:
+                self.animated_image_reader.close()
+            except Exception:
+                pass
+        self.animated_image_reader = None
+        self.animated_image_frame_count = 0
+        self.animated_image_index = 0
+        self.animated_image_label = None
+        self.animated_image_path = None
+
+    def try_start_animated_image(self, label, path):
+        path = Path(path)
+        if path.suffix.lower() not in (".gif", ".webp") or self.viewer_mode != "single":
+            return False
+        if self.animated_image_path == path and self.animated_image_label is label and self.animated_image_reader is not None:
+            self.render_animated_image_frame()
+            return True
+        reader = None
+        try:
+            reader = Image.open(path)
+            if not getattr(reader, "is_animated", False) or getattr(reader, "n_frames", 1) <= 1:
+                reader.close()
+                return False
+        except Exception:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+            return False
+        self.stop_animated_image()
+        self.animated_image_reader = reader
+        self.animated_image_frame_count = max(1, int(getattr(reader, "n_frames", 1)))
+        self.animated_image_index = 0
+        self.animated_image_label = label
+        self.animated_image_path = path
+        duration = self.render_animated_image_frame()
+        self.animated_image_timer.start(duration)
+        return True
+
+    def render_animated_image_frame(self):
+        if self.animated_image_label is None:
+            return 80
+        if self.animated_image_reader is None:
+            return 80
+        try:
+            self.animated_image_reader.seek(self.animated_image_index)
+            duration = self.animated_image_reader.info.get("duration", 80)
+            duration = max(20, int(duration or 80))
+            pix = QPixmap.fromImage(ImageQt(self.animated_image_reader.convert("RGBA")))
+        except Exception:
+            return 80
+        if pix.isNull():
+            return duration
+        if self.rotation:
+            from PySide6.QtGui import QTransform
+            pix = pix.transformed(QTransform().rotate(self.rotation), Qt.SmoothTransformation)
+        target = self.target_size(self.animated_image_label, pix)
+        self.animated_image_label.setPixmap(pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        return duration
+
+    def advance_animated_image(self):
+        if self.animated_image_label is None or self.animated_image_frame_count <= 0 or self.animated_image_reader is None:
+            self.stop_animated_image()
+            return
+        self.animated_image_index = (self.animated_image_index + 1) % self.animated_image_frame_count
+        duration = self.render_animated_image_frame()
+        self.animated_image_timer.start(duration)
+
     def update_image_labels(self):
         for label, path in self.labels:
-            if path.suffix.lower() == ".gif" and self.viewer_mode == "single":
-                movie = QMovie(str(path))
-                if movie.isValid():
-                    self.movie = movie
-                    label.setMovie(movie)
-                    movie.start()
-                    continue
+            if self.try_start_animated_image(label, path):
+                continue
             pix = QPixmap(str(path))
             if pix.isNull():
                 label.setText(path.name)
@@ -1750,9 +1827,11 @@ class MainWindow(QMainWindow):
         self.mouse_wheel_hook.install()
         self.remove_legacy_thumb_cache()
         self.ensure_folder_tab()
-        self.load_folder(self.current_folder)
         if self.startup_media_path:
+            self.prepare_startup_media_folder()
             QTimer.singleShot(0, self.open_startup_media)
+        else:
+            self.load_folder(self.current_folder)
 
     def _build_ui(self):
         self.tree_model = QFileSystemModel()
@@ -1963,8 +2042,13 @@ class MainWindow(QMainWindow):
             return
         path = self.current_folder
         self.tabs.append({"path": path, "display": str(path), "history": [str(path)], "history_index": 0})
-        self.folder_tabs.addTab(path.name or str(path))
-        self.folder_tabs.setCurrentIndex(0)
+        self._loading_tab = True
+        try:
+            self.folder_tabs.addTab(path.name or str(path))
+            self.folder_tabs.setCurrentIndex(0)
+            self.current_tab = 0
+        finally:
+            self._loading_tab = False
 
     def add_folder_tab(self):
         self.save_current_tab()
@@ -2165,6 +2249,31 @@ class MainWindow(QMainWindow):
         except OSError:
             return False
 
+    def collect_media_paths(self, folder):
+        media_paths = []
+        try:
+            for child in Path(folder).iterdir():
+                if child.is_file() and is_media(child):
+                    media_paths.append(str(child))
+        except (PermissionError, FileNotFoundError, OSError):
+            pass
+        return media_paths
+
+    def prepare_startup_media_folder(self):
+        self.virtual_unc_server = ""
+        self.virtual_entries = []
+        self.display_path = str(self.current_folder)
+        self.path_edit.setText(self.display_path)
+        model_index = self.tree_model.index(str(self.current_folder))
+        if model_index.isValid():
+            self.tree.setCurrentIndex(model_index)
+        self.watch_current_folder()
+        self.media_paths = self.collect_media_paths(self.current_folder)
+        startup = str(self.startup_media_path)
+        if startup not in self.media_paths:
+            self.media_paths.insert(0, startup)
+        self.update_current_tab()
+
     def remove_legacy_thumb_cache(self):
         old_cache = RUN_DIR / ".thumb_cache"
         if old_cache.exists():
@@ -2293,6 +2402,8 @@ class MainWindow(QMainWindow):
             return self.icon_provider.icon(QFileInfo(str(entry.path)))
         if is_video(entry.path):
             return self.style().standardIcon(QStyle.SP_MediaPlay)
+        if entry.path.suffix.lower() == ".gif":
+            return self.icon_provider.icon(QFileInfo(str(entry.path)))
         try:
             with Image.open(entry.path) as img:
                 img = img.convert("RGBA")
