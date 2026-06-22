@@ -2458,7 +2458,7 @@ class MainWindow(QMainWindow):
         item = self.quick_paths.currentItem()
         if not item:
             return
-        text, ok = QInputDialog.getText(self, "Rename Shortcut", "Name", text=item.text())
+        text, ok = QInputDialog.getText(self, "Edit Shortcut Label", "Label", text=item.text())
         if ok and text.strip():
             item.setText(text.strip())
             self.save_quick_paths()
@@ -2475,7 +2475,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Add Current Folder", self.add_current_quick_path)
         menu.addAction("Add Path...", self.add_typed_quick_path)
-        menu.addAction("Rename", self.rename_quick_path)
+        menu.addAction("Edit Label", self.rename_quick_path)
         menu.addAction("Remove", self.remove_quick_path)
         menu.exec(self.quick_paths.mapToGlobal(pos))
 
