@@ -1,9 +1,11 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import ctypes
 import tempfile
+import time
 import zipfile
 from io import BytesIO
 from ctypes import wintypes
@@ -30,7 +32,7 @@ if not DEFAULT_START_FOLDER.exists():
 from PIL import Image
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QAbstractNativeEventFilter, QDir, QEvent, QFileInfo, QFileSystemWatcher, QMimeData, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QMovie, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QKeySequence, QMovie, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -437,16 +439,16 @@ class DetailsTable(QTableWidget):
             QTableWidget::item:selected { background: #5a1470; color: #ffffff; }
         """)
 
-    def load_entries(self, entries, icon_provider, make_icon):
+    def load_entries(self, entries, icon_provider, make_icon, lightweight=False):
         self.setRowCount(0)
         for row, entry in enumerate(entries):
             self.insertRow(row)
-            values = self.row_values(entry)
+            values = self.row_values(entry, lightweight=lightweight)
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.UserRole, str(entry.path))
                 if col == 0:
-                    item.setIcon(make_icon(entry))
+                    item.setIcon(icon_provider.icon(QFileInfo(str(entry.path))) if lightweight else make_icon(entry))
                 if col == 1:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 color = type_color(entry.path)
@@ -454,10 +456,23 @@ class DetailsTable(QTableWidget):
                     item.setBackground(color)
                 self.setItem(row, col, item)
 
-    def row_values(self, entry):
+    def row_values(self, entry, lightweight=False):
         if entry.is_dir:
             return [entry.display_name, "", "Folder", "", fmt_modified(entry.path), "", "", "", ""]
         size_kb = entry.path.stat().st_size // 1024
+        if lightweight:
+            kind = "Video" if is_video(entry.path) else entry.path.suffix.upper().strip(".")
+            return [
+                entry.display_name,
+                f"{size_kb:,}",
+                kind,
+                "",
+                fmt_modified(entry.path),
+                "",
+                "",
+                "",
+                "No",
+            ]
         return [
             entry.display_name,
             f"{size_kb:,}",
@@ -701,6 +716,7 @@ class ViewerWindow(QMainWindow):
         self.rotation = 0
         self.media_player = None
         self.vlc_instance = None
+        self.extra_media_players = []
         self.movie = None
         self._app_filter_installed = False
         self._seeking_video = False
@@ -708,11 +724,14 @@ class ViewerWindow(QMainWindow):
         self.video_finished = False
         self.video_stopped_by_user = False
         self.webtoon_scroll = None
+        self.active_display_path = None
+        self.video_thumbnail_cache = {}
         self.animated_image_reader = None
         self.animated_image_frame_count = 0
         self.animated_image_index = 0
         self.animated_image_label = None
         self.animated_image_path = None
+        self.animated_image_states = {}
 
         self.setWindowTitle(APP_NAME + " - Viewer")
         self.setMinimumSize(900, 640)
@@ -1013,17 +1032,16 @@ class ViewerWindow(QMainWindow):
             self.update_manual_zoom_controls()
         self.clear_grid()
         group = self.current_group()
+        self.active_display_path = self.focus_path_for_group(group)
         if not group:
             label = QLabel("No media")
             label.setAlignment(Qt.AlignCenter)
             self.grid.addWidget(label, 0, 0)
             return
 
-        self.current_is_video = len(group) == 1 and is_video(group[0])
-        if self.current_is_video:
-            self.grid.addWidget(self.video_frame, 0, 0)
-            self.play_video(group[0])
-        elif self.viewer_mode in ("webtoon", "webtoon_vertical"):
+        active_video_slots = self.active_video_slots_for_group(group)
+        self.current_is_video = bool(active_video_slots)
+        if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             container = QWidget()
             layout = QVBoxLayout(container)
             layout.setContentsMargins(0, 0, 0, 0)
@@ -1046,11 +1064,12 @@ class ViewerWindow(QMainWindow):
             self.schedule_image_update()
         else:
             for col, path in enumerate(group):
-                if is_video(path):
-                    label = QLabel("Video\n" + path.name)
-                    label.setAlignment(Qt.AlignCenter)
-                    label.setStyleSheet("background: #050505; color: white;")
-                    self.grid.addWidget(label, 0, col)
+                if col in active_video_slots:
+                    frame = self.video_frame if not self.media_player or self.video_path is None else self.create_video_frame()
+                    self.grid.addWidget(frame, 0, col)
+                    self.play_video(path, frame=frame, primary=(self.video_path is None))
+                elif is_video(path):
+                    self.grid.addWidget(self.make_video_preview_label(path), 0, col)
                 else:
                     label = QLabel()
                     label.setAlignment(Qt.AlignCenter)
@@ -1061,17 +1080,38 @@ class ViewerWindow(QMainWindow):
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             title_name = "webtoon"
         else:
-            title_name = self.items[self.index].name
+            title_name = self.active_display_path.name if self.active_display_path else self.items[self.index].name
         self.setWindowTitle(f"{APP_NAME} - {self.index + 1}/{len(self.items)} - {title_name}")
         self.update_filename_labels()
         self.position_overlays()
+
+    def active_video_slots_for_group(self, group):
+        if not group:
+            return set()
+        if len(group) == 1:
+            return {0} if is_video(group[0]) else set()
+        if self.step_mode == "page":
+            return {idx for idx, path in enumerate(group) if is_video(path)}
+        if self.viewer_mode == "triple":
+            return {1} if len(group) > 1 and is_video(group[1]) else set()
+        if self.viewer_mode == "double":
+            return {0} if is_video(group[0]) else set()
+        return set()
+
+    def focus_path_for_group(self, group):
+        if not group:
+            return None
+        if self.step_mode == "slide" and self.viewer_mode == "triple" and len(group) > 1:
+            return group[1]
+        return group[0]
 
     def current_file_name(self):
         if not self.items:
             return ""
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             return f"webtoon ({len([p for p in self.items if is_image(p)])} images)"
-        return self.items[self.index].name
+        path = getattr(self, "active_display_path", None)
+        return (path or self.items[self.index]).name
 
     def update_filename_labels(self):
         name = self.current_file_name()
@@ -1088,27 +1128,89 @@ class ViewerWindow(QMainWindow):
         QTimer.singleShot(0, self.update_image_labels)
         QTimer.singleShot(40, self.update_image_labels)
 
-    def play_video(self, path):
-        if not self.media_player or not self.vlc_instance:
+    def create_video_frame(self):
+        frame = QFrame()
+        frame.setStyleSheet("background: #000;")
+        frame.setFocusPolicy(Qt.StrongFocus)
+        frame.setMouseTracking(True)
+        frame.installEventFilter(self)
+        return frame
+
+    def play_video(self, path, frame=None, primary=True):
+        if not self.vlc_instance:
             label = QLabel("VLC runtime not available\n" + path.name)
             label.setAlignment(Qt.AlignCenter)
             self.grid.addWidget(label, 0, 0)
             return
-        self.video_path = Path(path)
-        self.video_finished = False
-        self.video_stopped_by_user = False
+        frame = frame or self.video_frame
+        player = self.media_player if primary else self.vlc_instance.media_player_new()
+        if not player:
+            return
+        if primary:
+            self.video_path = Path(path)
+            self.video_finished = False
+            self.video_stopped_by_user = False
+        else:
+            self.extra_media_players.append(player)
         media = self.vlc_instance.media_new(str(path))
-        self.media_player.set_media(media)
-        self.media_player.set_hwnd(int(self.video_frame.winId()))
+        player.set_media(media)
+        player.set_hwnd(int(frame.winId()))
         try:
-            self.media_player.video_set_mouse_input(False)
-            self.media_player.video_set_key_input(False)
+            player.video_set_mouse_input(False)
+            player.video_set_key_input(False)
         except Exception:
             pass
-        self.media_player.play()
-        self.media_player.audio_set_volume(self.volume_slider.value())
-        self.video_timer.start(250)
-        self.video_frame.setFocus()
+        player.play()
+        player.audio_set_volume(self.volume_slider.value())
+        if primary:
+            self.video_timer.start(250)
+            frame.setFocus()
+
+    def make_video_preview_label(self, path):
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet("background: #050505;")
+        label.setPixmap(self.video_preview_pixmap(Path(path)))
+        label.setToolTip(Path(path).name)
+        return label
+
+    def video_preview_pixmap(self, path):
+        size = self.viewer_area()
+        width = max(220, size.width())
+        height = max(220, size.height())
+        pix = QPixmap(width, height)
+        pix.fill(QColor("#050505"))
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(0, 0, width, height, QColor("#050505"))
+        painter.setPen(QColor("#2a2f38"))
+        painter.drawRect(0, 0, width - 1, height - 1)
+
+        thumb = self.video_thumbnail_cache.get(str(path))
+        if thumb is None:
+            thumb = windows_shell_thumbnail(path, max(256, min(768, max(width, height))))
+            self.video_thumbnail_cache[str(path)] = thumb if thumb is not None else False
+        if thumb is False:
+            thumb = None
+        if thumb is not None and not thumb.isNull():
+            scaled = thumb.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawPixmap((width - scaled.width()) // 2, (height - scaled.height()) // 2, scaled)
+            painter.fillRect(0, 0, width, height, QColor(0, 0, 0, 55))
+
+        play_font = QFont()
+        play_font.setPointSize(max(28, min(width, height) // 10))
+        play_font.setBold(True)
+        painter.setFont(play_font)
+        painter.setPen(QColor("#e8eef8"))
+        painter.drawText(0, max(0, height // 2 - 88), width, 96, Qt.AlignCenter, "▶")
+
+        name_font = QFont()
+        name_font.setPointSize(11)
+        painter.setFont(name_font)
+        painter.setPen(QColor("#f2f6ff"))
+        painter.drawText(24, max(0, height // 2 + 18), max(1, width - 48), 72, Qt.AlignCenter | Qt.TextWordWrap, path.name)
+        painter.end()
+        return pix
 
     def stop_media(self):
         self.movie = None
@@ -1117,11 +1219,18 @@ class ViewerWindow(QMainWindow):
         self.video_finished = False
         if hasattr(self, "video_timer"):
             self.video_timer.stop()
+        for player in getattr(self, "extra_media_players", []):
+            try:
+                player.stop()
+            except Exception:
+                pass
+        self.extra_media_players = []
         if self.media_player:
             try:
                 self.media_player.stop()
             except Exception:
                 pass
+        self.video_path = None
         if hasattr(self, "seek_slider"):
             self.seek_slider.blockSignals(True)
             self.seek_slider.setValue(0)
@@ -1131,6 +1240,12 @@ class ViewerWindow(QMainWindow):
     def stop_animated_image(self):
         if hasattr(self, "animated_image_timer"):
             self.animated_image_timer.stop()
+        for state in getattr(self, "animated_image_states", {}).values():
+            try:
+                state["reader"].close()
+            except Exception:
+                pass
+        self.animated_image_states = {}
         if self.animated_image_reader is not None:
             try:
                 self.animated_image_reader.close()
@@ -1144,10 +1259,12 @@ class ViewerWindow(QMainWindow):
 
     def try_start_animated_image(self, label, path):
         path = Path(path)
-        if path.suffix.lower() not in (".gif", ".webp") or self.viewer_mode != "single":
+        if path.suffix.lower() not in (".gif", ".webp"):
             return False
-        if self.animated_image_path == path and self.animated_image_label is label and self.animated_image_reader is not None:
-            self.render_animated_image_frame()
+        key = id(label)
+        existing = self.animated_image_states.get(key)
+        if existing and existing.get("path") == path and existing.get("label") is label:
+            self.render_animated_image_frame(existing)
             return True
         reader = None
         try:
@@ -1162,26 +1279,47 @@ class ViewerWindow(QMainWindow):
                 except Exception:
                     pass
             return False
-        self.stop_animated_image()
+        if existing:
+            try:
+                existing["reader"].close()
+            except Exception:
+                pass
+        state = {
+            "reader": reader,
+            "frame_count": max(1, int(getattr(reader, "n_frames", 1))),
+            "index": 0,
+            "label": label,
+            "path": path,
+            "next_due": 0.0,
+        }
+        self.animated_image_states[key] = state
         self.animated_image_reader = reader
-        self.animated_image_frame_count = max(1, int(getattr(reader, "n_frames", 1)))
+        self.animated_image_frame_count = state["frame_count"]
         self.animated_image_index = 0
         self.animated_image_label = label
         self.animated_image_path = path
-        duration = self.render_animated_image_frame()
-        self.animated_image_timer.start(duration)
+        duration = self.render_animated_image_frame(state)
+        state["next_due"] = time.monotonic() + (duration / 1000.0)
+        if not self.animated_image_timer.isActive():
+            self.animated_image_timer.start(30)
         return True
 
-    def render_animated_image_frame(self):
-        if self.animated_image_label is None:
+    def render_animated_image_frame(self, state=None):
+        if state is None:
+            if not self.animated_image_states:
+                return 80
+            state = next(iter(self.animated_image_states.values()))
+        label = state.get("label")
+        reader = state.get("reader")
+        if label is None:
             return 80
-        if self.animated_image_reader is None:
+        if reader is None:
             return 80
         try:
-            self.animated_image_reader.seek(self.animated_image_index)
-            duration = self.animated_image_reader.info.get("duration", 80)
+            reader.seek(state["index"])
+            duration = reader.info.get("duration", 80)
             duration = max(20, int(duration or 80))
-            pix = QPixmap.fromImage(ImageQt(self.animated_image_reader.convert("RGBA")))
+            pix = QPixmap.fromImage(ImageQt(reader.convert("RGBA")))
         except Exception:
             return 80
         if pix.isNull():
@@ -1189,17 +1327,33 @@ class ViewerWindow(QMainWindow):
         if self.rotation:
             from PySide6.QtGui import QTransform
             pix = pix.transformed(QTransform().rotate(self.rotation), Qt.SmoothTransformation)
-        target = self.target_size(self.animated_image_label, pix)
-        self.animated_image_label.setPixmap(pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        target = self.target_size(label, pix)
+        label.setPixmap(pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         return duration
 
     def advance_animated_image(self):
-        if self.animated_image_label is None or self.animated_image_frame_count <= 0 or self.animated_image_reader is None:
+        if not self.animated_image_states:
             self.stop_animated_image()
             return
-        self.animated_image_index = (self.animated_image_index + 1) % self.animated_image_frame_count
-        duration = self.render_animated_image_frame()
-        self.animated_image_timer.start(duration)
+        now = time.monotonic()
+        for key, state in list(self.animated_image_states.items()):
+            label = state.get("label")
+            reader = state.get("reader")
+            if label is None or reader is None or label.parent() is None:
+                try:
+                    if reader is not None:
+                        reader.close()
+                except Exception:
+                    pass
+                self.animated_image_states.pop(key, None)
+                continue
+            if now < state.get("next_due", 0.0):
+                continue
+            state["index"] = (state["index"] + 1) % state["frame_count"]
+            duration = self.render_animated_image_frame(state)
+            state["next_due"] = now + (duration / 1000.0)
+        if not self.animated_image_states:
+            self.animated_image_timer.stop()
 
     def update_image_labels(self):
         for label, path in self.labels:
@@ -1806,6 +1960,12 @@ class MainWindow(QMainWindow):
         self.display_path = str(self.current_folder)
         self.virtual_unc_server = ""
         self.virtual_entries = []
+        self.thumbnail_cache = {}
+        self.thumbnail_queue = []
+        self.thumbnail_queued = set()
+        self.thumbnail_visible_batch = 4
+        self.thumbnail_idle_batch = 2
+        self.cut_clipboard_paths = set()
         self.tabs = []
         self.current_tab = 0
         self._loading_tab = False
@@ -1814,6 +1974,9 @@ class MainWindow(QMainWindow):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setSingleShot(True)
         self.refresh_timer.timeout.connect(self.reload_current_if_available)
+        self.thumbnail_timer = QTimer(self)
+        self.thumbnail_timer.setInterval(35)
+        self.thumbnail_timer.timeout.connect(self.process_next_thumbnail)
         self.icon_provider = QFileIconProvider()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
@@ -1872,8 +2035,11 @@ class MainWindow(QMainWindow):
         self.list.copyRequested.connect(self.copy_selected)
         self.list.deleteRequested.connect(self.delete_selected)
         self.list.pasteRequested.connect(self.paste_from_clipboard)
+        self.list.itemSelectionChanged.connect(self.update_command_buttons)
         self.list.installEventFilter(self)
         self.list.viewport().installEventFilter(self)
+        self.list.verticalScrollBar().valueChanged.connect(self.prioritize_visible_thumbnails)
+        self.list.horizontalScrollBar().valueChanged.connect(self.prioritize_visible_thumbnails)
 
         self.details = DetailsTable()
         self.details.openRequested.connect(self.open_path)
@@ -1884,8 +2050,11 @@ class MainWindow(QMainWindow):
         self.details.copyRequested.connect(self.copy_selected)
         self.details.deleteRequested.connect(self.delete_selected)
         self.details.pasteRequested.connect(self.paste_from_clipboard)
+        self.details.itemSelectionChanged.connect(self.update_command_buttons)
         self.details.installEventFilter(self)
         self.details.viewport().installEventFilter(self)
+        self.details.verticalScrollBar().valueChanged.connect(self.prioritize_visible_thumbnails)
+        self.details.horizontalScrollBar().valueChanged.connect(self.prioritize_visible_thumbnails)
         self.tree.installEventFilter(self)
 
         self.view_stack = QStackedWidget()
@@ -1941,13 +2110,23 @@ class MainWindow(QMainWindow):
 
         command_row = QHBoxLayout()
         command_row.setContentsMargins(0, 0, 0, 0)
+        self.select_button = QToolButton()
+        self.select_button.setCheckable(True)
+        self.select_button.setAutoRaise(True)
+        self.select_button.clicked.connect(self.toggle_select_all)
+        command_row.addWidget(self.select_button)
+        command_row.addSpacing(6)
         command_row.addWidget(self.make_icon_button("<", self.go_back))
         command_row.addWidget(self.make_icon_button(">", self.go_forward))
         command_row.addWidget(self.make_icon_button("^", self.go_up))
         command_row.addSpacing(8)
-        command_row.addWidget(self.make_sort_button())
-        command_row.addWidget(self.make_view_button())
-        command_row.addWidget(self.make_menu_button("Select", [("Select All", self.select_all_items)]))
+        self.sort_button = self.make_sort_button()
+        self.view_button = self.make_view_button()
+        command_row.addWidget(QLabel("Sort:"))
+        command_row.addWidget(self.sort_button)
+        command_row.addSpacing(8)
+        command_row.addWidget(QLabel("View:"))
+        command_row.addWidget(self.view_button)
         command_row.addStretch(1)
         header_layout.addLayout(command_row)
 
@@ -1963,6 +2142,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.main_stack)
         self.list.set_view_mode_name(self.view_combo.currentText())
         self.view_stack.setCurrentWidget(self.details if self.view_combo.currentText() == "details" else self.list)
+        self.update_command_buttons()
 
     def make_icon_button(self, text, callback):
         button = QToolButton()
@@ -1995,9 +2175,11 @@ class MainWindow(QMainWindow):
                 QTabBar::tab:selected { background: #4a4a4a; color: white; border-bottom: 2px solid #7fb7ff; font-weight: 700; }
             """)
 
-    def make_menu_button(self, text, entries):
+    def make_menu_button(self, text, entries, detail=""):
         button = QToolButton()
-        button.setText(text)
+        button.setText(detail or text)
+        button.setMinimumWidth(92)
+        button.setMinimumHeight(30)
         button.setPopupMode(QToolButton.InstantPopup)
         menu = QMenu(button)
         if entries:
@@ -2009,27 +2191,78 @@ class MainWindow(QMainWindow):
         button.setMenu(menu)
         return button
 
+    def two_line_button_text(self, title, detail):
+        detail = detail or "-"
+        return f"{title}\n{detail}"
+
+    def update_command_buttons(self):
+        if hasattr(self, "sort_button"):
+            self.sort_button.setText(self.sort_label())
+        if hasattr(self, "view_button"):
+            self.view_button.setText(self.view_combo.currentText())
+        if hasattr(self, "select_button"):
+            checked = self.all_items_selected()
+            self.select_button.setChecked(checked)
+            self.select_button.setText(("V" if checked else "□") + " Select all")
+
+    def sort_label(self):
+        mode = self.settings.get("sort_mode", "name_asc")
+        ascending = self.settings.get("sort_ascending", True)
+        if mode.endswith("_desc"):
+            ascending = False
+            mode = mode[:-5]
+        elif mode.endswith("_asc"):
+            ascending = True
+            mode = mode[:-4]
+        names = {
+            "name": "Name",
+            "size": "Size",
+            "type": "Type",
+            "modified": "Date",
+            "properties": "Props",
+        }
+        return f"{names.get(mode, mode.title())} {'^' if ascending else 'v'}"
+
     def make_view_button(self):
         entries = []
         for mode in ["large", "medium", "small", "list", "details"]:
             entries.append((mode, lambda m=mode: self.view_combo.setCurrentText(m)))
-        return self.make_menu_button("View", entries)
+        return self.make_menu_button("View", entries, self.view_combo.currentText())
 
     def make_sort_button(self):
         entries = [
-            ("Filename", lambda: self.set_sort_from_header("name", True)),
-            ("Size (KB)", lambda: self.set_sort_from_header("size", True)),
-            ("Image Type", lambda: self.set_sort_from_header("type", True)),
-            ("Modified Date", lambda: self.set_sort_from_header("modified", True)),
-            ("Image Properties", lambda: self.set_sort_from_header("properties", True)),
+            ("Filename", lambda: self.set_sort_from_header("name")),
+            ("Size (KB)", lambda: self.set_sort_from_header("size")),
+            ("Image Type", lambda: self.set_sort_from_header("type")),
+            ("Modified Date", lambda: self.set_sort_from_header("modified")),
+            ("Image Properties", lambda: self.set_sort_from_header("properties")),
         ]
-        return self.make_menu_button("Sort", entries)
+        return self.make_menu_button("Sort", entries, self.sort_label())
 
     def select_all_items(self):
         if self.view_combo.currentText() == "details":
             self.details.selectAll()
         else:
             self.list.selectAll()
+        self.update_command_buttons()
+
+    def clear_selection(self):
+        self.details.clearSelection()
+        self.list.clearSelection()
+        self.update_command_buttons()
+
+    def all_items_selected(self):
+        if self.view_combo.currentText() == "details":
+            total = self.details.rowCount()
+            return total > 0 and len({idx.row() for idx in self.details.selectedIndexes()}) >= total
+        total = self.list.count()
+        return total > 0 and len(self.list.selectedItems()) >= total
+
+    def toggle_select_all(self):
+        if self.all_items_selected():
+            self.clear_selection()
+        else:
+            self.select_all_items()
 
     def apply_quick_search(self):
         self.populate_list()
@@ -2050,9 +2283,11 @@ class MainWindow(QMainWindow):
         finally:
             self._loading_tab = False
 
-    def add_folder_tab(self):
+    def add_folder_tab(self, path=None):
         self.save_current_tab()
-        path = DEFAULT_START_FOLDER
+        path = Path(path) if path else DEFAULT_START_FOLDER
+        if not self.safe_is_dir(path):
+            path = DEFAULT_START_FOLDER
         self.tabs.append({"path": path, "display": str(path), "history": [str(path)], "history_index": 0})
         index = self.folder_tabs.addTab(path.name or str(path))
         self.folder_tabs.setCurrentIndex(index)
@@ -2130,7 +2365,7 @@ class MainWindow(QMainWindow):
             ("modified", "Modified Date"),
             ("properties", "Image Properties"),
         ]:
-            sort_menu.addAction(label, lambda checked=False, k=key: self.set_sort_from_header(k, True))
+            sort_menu.addAction(label, lambda checked=False, k=key: self.set_sort_from_header(k))
         sort_button = QPushButton("Sort")
         sort_button.setMenu(sort_menu)
         self.nav_toolbar.addWidget(sort_button)
@@ -2307,21 +2542,28 @@ class MainWindow(QMainWindow):
         self.update_current_tab()
         return True
 
-    def populate_list(self):
+    def populate_list(self, lightweight=True):
+        self.thumbnail_timer.stop()
+        self.thumbnail_queue = []
+        self.thumbnail_queued = set()
         self.list.clear()
         self.details.setRowCount(0)
         if self.virtual_unc_server:
             entries = [MediaItem(path, True, label) for label, path in self.virtual_entries]
             self.entries = entries
             self.media_paths = []
-            self.details.load_entries(entries, self.icon_provider, self.make_icon)
-            if self.view_combo.currentText() != "details":
+            if self.view_combo.currentText() == "details":
+                self.details.load_entries(entries, self.icon_provider, self.make_icon, lightweight=lightweight)
+            else:
                 for entry in entries:
                     item = QListWidgetItem(entry.path.name)
                     item.setData(Qt.UserRole, str(entry.path))
                     item.setToolTip(str(entry.path))
-                    item.setIcon(self.make_icon(entry))
+                    item.setIcon(self.entry_icon(entry, lightweight=lightweight))
                     self.list.addItem(item)
+            self.update_command_buttons()
+            if lightweight:
+                self.start_thumbnail_loading()
             return
         entries = []
         if not self.safe_is_dir(self.current_folder):
@@ -2347,18 +2589,179 @@ class MainWindow(QMainWindow):
         self.entries = entries
 
         self.media_paths = [str(e.path) for e in entries if not e.is_dir and is_media(e.path)]
-        self.details.load_entries(entries, self.icon_provider, self.make_icon)
         if self.view_combo.currentText() == "details":
+            self.details.load_entries(entries, self.icon_provider, self.make_icon, lightweight=lightweight)
+            self.update_command_buttons()
+            if lightweight:
+                self.start_thumbnail_loading()
             return
         for entry in entries:
             item = QListWidgetItem(entry.display_name)
             item.setData(Qt.UserRole, str(entry.path))
             item.setToolTip(str(entry.path))
-            item.setIcon(self.make_icon(entry))
+            item.setIcon(self.entry_icon(entry, lightweight=lightweight))
             color = type_color(entry.path)
             if color is not None:
                 item.setBackground(color)
             self.list.addItem(item)
+        self.update_command_buttons()
+        if lightweight:
+            self.start_thumbnail_loading()
+
+    def entry_icon(self, entry, lightweight=True):
+        cached = self.thumbnail_cache.get(str(entry.path))
+        if cached is not None:
+            return cached
+        if lightweight:
+            return self.icon_provider.icon(QFileInfo(str(entry.path)))
+        return self.make_icon(entry)
+
+    def start_thumbnail_loading(self):
+        self.thumbnail_queue = []
+        self.thumbnail_queued = set()
+        QTimer.singleShot(0, self.prioritize_visible_thumbnails)
+
+    def queue_thumbnail(self, path, front=False):
+        path = str(path)
+        if path in self.thumbnail_cache or path in self.thumbnail_queued:
+            return
+        p = Path(path)
+        if not p.exists() or p.is_dir() or is_archive(p):
+            return
+        if not is_media(p):
+            return
+        self.thumbnail_queued.add(path)
+        if front:
+            self.thumbnail_queue.insert(0, path)
+        else:
+            self.thumbnail_queue.append(path)
+
+    def prioritize_visible_thumbnails(self):
+        if not hasattr(self, "entries"):
+            return
+        visible = self.visible_paths()
+        if not visible:
+            visible = [str(entry.path) for entry in self.entries[:24]]
+        visible_set = {str(path) for path in visible}
+        self.thumbnail_queue = [path for path in self.thumbnail_queue if path in visible_set]
+        self.thumbnail_queued = {path for path in self.thumbnail_queued if path in visible_set}
+        for path in reversed(visible):
+            path = str(path)
+            if path in self.thumbnail_queued:
+                try:
+                    self.thumbnail_queue.remove(path)
+                except ValueError:
+                    pass
+                self.thumbnail_queue.insert(0, path)
+            else:
+                self.queue_thumbnail(path, front=True)
+        if self.thumbnail_queue and not self.thumbnail_timer.isActive():
+            self.thumbnail_timer.start()
+
+    def visible_paths(self):
+        paths = []
+        if self.view_combo.currentText() == "details":
+            viewport = self.details.viewport()
+            top = self.details.rowAt(0)
+            bottom = self.details.rowAt(max(0, viewport.height() - 1))
+            if top < 0:
+                top = 0
+            if bottom < 0:
+                bottom = min(self.details.rowCount() - 1, top + 40)
+            for row in range(top, min(self.details.rowCount(), bottom + 1)):
+                item = self.details.item(row, 0)
+                if item:
+                    paths.append(item.data(Qt.UserRole))
+        else:
+            rect = self.list.viewport().rect()
+            for row in range(self.list.count()):
+                item = self.list.item(row)
+                if self.list.visualItemRect(item).intersects(rect):
+                    paths.append(item.data(Qt.UserRole))
+        return paths
+
+    def process_next_thumbnail(self):
+        if not self.thumbnail_queue:
+            self.thumbnail_timer.stop()
+            return
+        visible_set = {str(path) for path in self.visible_paths()}
+        batch = self.thumbnail_idle_batch
+        if visible_set and any(path in visible_set for path in self.thumbnail_queue[: max(1, self.thumbnail_visible_batch * 2)]):
+            batch = self.thumbnail_visible_batch
+        processed = 0
+        while self.thumbnail_queue and processed < batch:
+            path = self.thumbnail_queue.pop(0)
+            self.thumbnail_queued.discard(path)
+            if processed > 0 and visible_set and path not in visible_set:
+                self.thumbnail_queue.append(path)
+                self.thumbnail_queued.add(path)
+                if not any(next_path in visible_set for next_path in self.thumbnail_queue[: max(1, self.thumbnail_visible_batch * 2)]):
+                    break
+                continue
+            if path in self.thumbnail_cache:
+                icon = self.thumbnail_cache[path]
+            else:
+                p = Path(path)
+                try:
+                    icon = self.make_thumbnail_icon(MediaItem(p, p.is_dir()))
+                except Exception:
+                    icon = self.icon_provider.icon(QFileInfo(str(p)))
+                self.thumbnail_cache[path] = icon
+            self.apply_thumbnail_icon(path, icon)
+            processed += 1
+        if not self.thumbnail_queue:
+            self.thumbnail_timer.stop()
+            QTimer.singleShot(250, self.queue_idle_thumbnail)
+
+    def queue_idle_thumbnail(self):
+        if self.thumbnail_timer.isActive() or self.thumbnail_queue:
+            return
+        visible_set = {str(path) for path in self.visible_paths()}
+        queued = 0
+        for entry in self.entries:
+            path = str(entry.path)
+            if path in visible_set or path in self.thumbnail_cache:
+                continue
+            self.queue_thumbnail(path, front=False)
+            queued += 1
+            if queued >= self.thumbnail_idle_batch:
+                break
+        if self.thumbnail_queue:
+            self.thumbnail_timer.start()
+
+    def apply_thumbnail_icon(self, path, icon):
+        path = str(path)
+        for row in range(self.list.count()):
+            item = self.list.item(row)
+            if item and item.data(Qt.UserRole) == path:
+                item.setIcon(icon)
+                break
+        for row in range(self.details.rowCount()):
+            item = self.details.item(row, 0)
+            if item and item.data(Qt.UserRole) == path:
+                item.setIcon(icon)
+                break
+
+    def make_thumbnail_icon(self, entry):
+        if entry.is_dir:
+            return self.icon_provider.icon(QFileInfo(str(entry.path)))
+        if is_video(entry.path):
+            return self.make_icon(entry)
+        try:
+            with Image.open(entry.path) as img:
+                if getattr(img, "is_animated", False):
+                    img.seek(0)
+                img = img.convert("RGBA")
+                img.thumbnail((192, 192))
+                canvas = Image.new("RGBA", (192, 192), (0, 0, 0, 255))
+                canvas.alpha_composite(img, ((192 - img.width) // 2, (192 - img.height) // 2))
+                data = BytesIO()
+                canvas.save(data, format="PNG")
+                pix = QPixmap()
+                pix.loadFromData(data.getvalue(), "PNG")
+                return QIcon(pix)
+        except Exception:
+            return self.icon_provider.icon(QFileInfo(str(entry.path)))
 
     def sorted_entries(self, entries, sort_mode, ascending):
         def key_name(item):
@@ -2391,16 +2794,34 @@ class MainWindow(QMainWindow):
         entries.sort(key=lambda x: not x.is_dir)
         return entries
 
-    def set_sort_from_header(self, key, ascending):
+    def set_sort_from_header(self, key, ascending=None):
+        current_key = self.settings.get("sort_mode", "name")
+        if current_key.endswith("_desc"):
+            current_key = current_key[:-5]
+        elif current_key.endswith("_asc"):
+            current_key = current_key[:-4]
+        current_ascending = self.settings.get("sort_ascending", True)
+        if ascending is None:
+            ascending = not current_ascending if current_key == key else True
         self.settings["sort_mode"] = key
         self.settings["sort_ascending"] = ascending
         save_settings(self.settings)
+        self.update_command_buttons()
         self.populate_list()
 
     def make_icon(self, entry):
         if entry.is_dir:
             return self.icon_provider.icon(QFileInfo(str(entry.path)))
         if is_video(entry.path):
+            pix = windows_shell_thumbnail(entry.path, 192)
+            if pix is not None and not pix.isNull():
+                canvas = QPixmap(192, 192)
+                canvas.fill(QColor("#050505"))
+                painter = QPainter(canvas)
+                scaled = pix.scaled(192, 192, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                painter.drawPixmap((192 - scaled.width()) // 2, (192 - scaled.height()) // 2, scaled)
+                painter.end()
+                return QIcon(canvas)
             return self.style().standardIcon(QStyle.SP_MediaPlay)
         if entry.path.suffix.lower() == ".gif":
             return self.icon_provider.icon(QFileInfo(str(entry.path)))
@@ -2423,6 +2844,7 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.list.set_view_mode_name(mode)
         self.view_stack.setCurrentWidget(self.details if mode == "details" else self.list)
+        self.update_command_buttons()
         self.populate_list()
 
     def reload_current(self):
@@ -2542,6 +2964,10 @@ class MainWindow(QMainWindow):
             items = [self.list.currentItem()]
         return [Path(i.data(Qt.UserRole)) for i in items]
 
+    def selected_primary_path(self):
+        paths = self.selected_paths()
+        return paths[0] if paths else self.current_folder
+
     def copy_selected(self):
         if self.main_stack.currentWidget() != self.explorer_root:
             return
@@ -2550,9 +2976,20 @@ class MainWindow(QMainWindow):
             return
         paths = self.selected_paths()
         if paths:
-            copy_files_to_clipboard(paths)
+            self.copy_paths(paths)
 
-    def paste_from_clipboard(self):
+    def copy_paths(self, paths):
+        self.cut_clipboard_paths = set()
+        copy_files_to_clipboard(paths)
+
+    def cut_paths(self, paths):
+        existing = [Path(path) for path in paths if Path(path).exists()]
+        if not existing:
+            return
+        copy_files_to_clipboard(existing)
+        self.cut_clipboard_paths = {str(path) for path in existing}
+
+    def paste_from_clipboard(self, target_folder=None):
         active_viewer = bool(self.viewer and self.main_stack.currentWidget() == self.viewer)
         active_explorer = self.main_stack.currentWidget() == self.explorer_root
         if not active_explorer and not active_viewer:
@@ -2560,22 +2997,26 @@ class MainWindow(QMainWindow):
         focus = QApplication.focusWidget()
         if active_explorer and focus in (self.path_edit, getattr(self, "quick_search", None)):
             return
-        if self.virtual_unc_server or not self.safe_is_dir(self.current_folder):
+        target_folder = Path(target_folder) if target_folder else self.current_folder
+        if self.virtual_unc_server or not self.safe_is_dir(target_folder):
             return
         urls = QApplication.clipboard().mimeData().urls()
         sources = [Path(url.toLocalFile()) for url in urls if url.isLocalFile()]
         if not sources:
             return
+        move_mode = bool(self.cut_clipboard_paths) and all(str(source) in self.cut_clipboard_paths for source in sources)
         copied = []
         for source in sources:
             if not source.exists():
                 continue
             try:
-                target = unique_copy_target(self.current_folder / source.name)
+                target = unique_copy_target(target_folder / source.name)
                 if source.is_dir() and path_contains(source, target):
                     QMessageBox.warning(self, "Paste failed", f"Cannot paste a folder into itself:\n{source}")
                     continue
-                if source.is_dir():
+                if move_mode:
+                    shutil.move(str(source), str(target))
+                elif source.is_dir():
                     shutil.copytree(source, target)
                 else:
                     shutil.copy2(source, target)
@@ -2583,6 +3024,8 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.warning(self, "Paste failed", f"Could not paste:\n{source}\n\n{exc}")
                 break
+        if move_mode:
+            self.cut_clipboard_paths = set()
         self.populate_list()
         if active_viewer and self.viewer:
             current = str(self.viewer.items[self.viewer.index]) if self.viewer.items else ""
@@ -2629,7 +3072,7 @@ class MainWindow(QMainWindow):
         self.viewer.setFocus()
 
     def copy_from_viewer(self, path):
-        copy_files_to_clipboard([Path(path)])
+        self.copy_paths([Path(path)])
         if self.viewer:
             self.viewer.setFocus()
 
@@ -2682,7 +3125,7 @@ class MainWindow(QMainWindow):
         self.nav_toolbar.hide()
         if self.isFullScreen():
             self.showNormal()
-        self.populate_list()
+        self.populate_list(lightweight=True)
         if current:
             self.select_path(current)
 
@@ -2748,17 +3191,25 @@ class MainWindow(QMainWindow):
                     return True
         return super().eventFilter(obj, event)
 
-    def new_folder(self):
+    def new_folder(self, parent=None):
+        parent = Path(parent) if parent else self.current_folder
+        if not self.safe_is_dir(parent):
+            return
         name, ok = QInputDialog.getText(self, "New Folder", "Folder name")
         if ok and name.strip():
-            (self.current_folder / name.strip()).mkdir(exist_ok=True)
+            (parent / name.strip()).mkdir(exist_ok=True)
             self.populate_list()
 
     def rename_selected(self):
         paths = self.selected_paths()
         if not paths:
             return
-        path = paths[0]
+        self.rename_path(paths[0])
+
+    def rename_path(self, path):
+        path = Path(path)
+        if not path.exists():
+            return
         name, ok = QInputDialog.getText(self, "Rename", "New name", text=path.name)
         if ok and name.strip() and name.strip() != path.name:
             path.rename(path.with_name(name.strip()))
@@ -2766,6 +3217,12 @@ class MainWindow(QMainWindow):
 
     def delete_selected(self):
         paths = self.selected_paths()
+        if not paths:
+            return
+        self.delete_paths(paths)
+
+    def delete_paths(self, paths):
+        paths = [Path(path) for path in paths if Path(path).exists()]
         if not paths:
             return
         names = "\n".join(str(path) for path in paths[:10])
@@ -2780,30 +3237,81 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Delete failed", f"Could not move to recycle bin:\n{path}")
         self.populate_list()
 
+    def show_properties(self, path):
+        path = Path(path)
+        if not path.exists():
+            return
+        if sys.platform == "win32":
+            class ShellExecuteInfo(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("fMask", ctypes.c_ulong),
+                    ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int),
+                    ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIcon", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE),
+                ]
+            info = ShellExecuteInfo()
+            info.cbSize = ctypes.sizeof(ShellExecuteInfo)
+            info.fMask = 0x0000000C
+            info.hwnd = int(self.winId())
+            info.lpVerb = "properties"
+            info.lpFile = str(path)
+            info.nShow = 1
+            if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+                QMessageBox.warning(self, "Properties", f"Could not open properties:\n{path}")
+            return
+        os.startfile(str(path))
+
     def list_menu(self, pos):
+        item = self.list.itemAt(pos)
+        if item:
+            self.list.setCurrentItem(item)
         menu = QMenu(self)
-        menu.addAction("Open Viewer", self.open_selected_viewer)
-        selected_dirs = [p for p in self.selected_paths() if p.is_dir()]
-        if selected_dirs:
-            menu.addAction("Add Folder to Shortcuts", lambda p=selected_dirs[0]: self.add_quick_path(str(p)))
-            menu.addSeparator()
-        menu.addAction("Rename", self.rename_selected)
-        menu.addAction("Delete", self.delete_selected)
-        menu.addAction("New Folder", self.new_folder)
-        menu.addAction("Open in Explorer", self.open_in_explorer)
+        path = self.selected_primary_path()
+        menu.addAction("Open Viewer (&V)", self.open_selected_viewer)
+        menu.addSeparator()
+        menu.addAction("Open in Windows (&E)", lambda p=path: self.open_in_explorer(p))
+        menu.addSeparator()
+        menu.addAction("New Folder (&N)", self.new_folder)
+        menu.addSeparator()
+        menu.addAction("Cut (&T)", lambda: self.cut_paths(self.selected_paths()))
+        menu.addAction("Copy (&C)", self.copy_selected)
+        menu.addAction("Paste (&P)", self.paste_from_clipboard)
+        menu.addAction("Rename (&M)", self.rename_selected)
+        menu.addAction("Delete (&D)", self.delete_selected)
+        menu.addSeparator()
+        menu.addAction("Properties (&R)", lambda p=path: self.show_properties(p))
         menu.exec(self.list.mapToGlobal(pos))
 
     def details_menu(self, pos):
+        item = self.details.itemAt(pos)
+        if item:
+            self.details.selectRow(item.row())
         menu = QMenu(self)
-        menu.addAction("Open Viewer", self.open_selected_viewer)
-        selected_dirs = [p for p in self.selected_paths() if p.is_dir()]
-        if selected_dirs:
-            menu.addAction("Add Folder to Shortcuts", lambda p=selected_dirs[0]: self.add_quick_path(str(p)))
-            menu.addSeparator()
-        menu.addAction("Rename", self.rename_selected)
-        menu.addAction("Delete", self.delete_selected)
-        menu.addAction("New Folder", self.new_folder)
-        menu.addAction("Open in Explorer", self.open_in_explorer)
+        path = self.selected_primary_path()
+        menu.addAction("Open Viewer (&V)", self.open_selected_viewer)
+        menu.addSeparator()
+        menu.addAction("Open in Windows (&E)", lambda p=path: self.open_in_explorer(p))
+        menu.addSeparator()
+        menu.addAction("New Folder (&N)", self.new_folder)
+        menu.addSeparator()
+        menu.addAction("Cut (&T)", lambda: self.cut_paths(self.selected_paths()))
+        menu.addAction("Copy (&C)", self.copy_selected)
+        menu.addAction("Paste (&P)", self.paste_from_clipboard)
+        menu.addAction("Rename (&M)", self.rename_selected)
+        menu.addAction("Delete (&D)", self.delete_selected)
+        menu.addSeparator()
+        menu.addAction("Properties (&R)", lambda p=path: self.show_properties(p))
         menu.exec(self.details.mapToGlobal(pos))
 
     def tree_menu(self, pos):
@@ -2811,14 +3319,31 @@ class MainWindow(QMainWindow):
         index = self.tree.indexAt(pos)
         path = Path(self.tree_model.filePath(index)) if index.isValid() else self.current_folder
         if path.exists() and path.is_dir():
-            menu.addAction("Add to Shortcuts", lambda p=path: self.add_quick_path(str(p)))
+            if index.isValid():
+                self.tree.setCurrentIndex(index)
+            menu.addAction("Add Shortcut (&S)", lambda p=path: self.add_quick_path(str(p)))
             menu.addSeparator()
-        menu.addAction("New Folder", self.new_folder)
-        menu.addAction("Open in Explorer", self.open_in_explorer)
+            menu.addAction("Open in Windows (&E)", lambda p=path: self.open_in_explorer(p))
+            menu.addSeparator()
+            menu.addAction("Add Tab (&B)", lambda p=path: self.add_folder_tab(p))
+            menu.addSeparator()
+            menu.addAction("New Folder (&N)", lambda p=path: self.new_folder(p))
+            menu.addSeparator()
+            menu.addAction("Cut (&T)", lambda p=path: self.cut_paths([p]))
+            menu.addAction("Copy (&C)", lambda p=path: self.copy_paths([p]))
+            menu.addAction("Paste (&P)", lambda p=path: self.paste_from_clipboard(p))
+            menu.addAction("Rename (&M)", lambda p=path: self.rename_path(p))
+            menu.addAction("Delete (&D)", lambda p=path: self.delete_paths([p]))
+            menu.addSeparator()
+            menu.addAction("Properties (&R)", lambda p=path: self.show_properties(p))
         menu.exec(self.tree.mapToGlobal(pos))
 
-    def open_in_explorer(self):
-        os.startfile(str(self.current_folder))
+    def open_in_explorer(self, path=None):
+        path = Path(path) if path else self.current_folder
+        if path.is_file():
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        else:
+            os.startfile(str(path))
 
     def open_shortcuts(self):
         dlg = ShortcutDialog(self.settings, self)
@@ -2854,6 +3379,117 @@ def copy_files_to_clipboard(paths):
     mime.setUrls([QUrl.fromLocalFile(str(path)) for path in existing])
     mime.setText("\n".join(str(path) for path in existing))
     QApplication.clipboard().setMimeData(mime)
+
+
+def windows_shell_thumbnail(path, size=512):
+    if sys.platform != "win32":
+        return None
+    try:
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        class SIZE(ctypes.Structure):
+            _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+        class BITMAP(ctypes.Structure):
+            _fields_ = [
+                ("bmType", ctypes.c_long),
+                ("bmWidth", ctypes.c_long),
+                ("bmHeight", ctypes.c_long),
+                ("bmWidthBytes", ctypes.c_long),
+                ("bmPlanes", wintypes.WORD),
+                ("bmBitsPixel", wintypes.WORD),
+                ("bmBits", ctypes.c_void_p),
+            ]
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", wintypes.DWORD),
+                ("biWidth", ctypes.c_long),
+                ("biHeight", ctypes.c_long),
+                ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD),
+                ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD),
+                ("biXPelsPerMeter", ctypes.c_long),
+                ("biYPelsPerMeter", ctypes.c_long),
+                ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD),
+            ]
+
+        class BITMAPINFO(ctypes.Structure):
+            _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+        class IShellItemImageFactory(ctypes.Structure):
+            pass
+
+        QueryInterface = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))
+        AddRef = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)
+        Release = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)
+        GetImage = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, SIZE, ctypes.c_int, ctypes.POINTER(wintypes.HBITMAP))
+
+        class IShellItemImageFactoryVtbl(ctypes.Structure):
+            _fields_ = [
+                ("QueryInterface", QueryInterface),
+                ("AddRef", AddRef),
+                ("Release", Release),
+                ("GetImage", GetImage),
+            ]
+
+        IShellItemImageFactory._fields_ = [("lpVtbl", ctypes.POINTER(IShellItemImageFactoryVtbl))]
+
+        iid = GUID(0xBCC18B79, 0xBA16, 0x442F, (ctypes.c_ubyte * 8)(0x80, 0xC4, 0x8A, 0x59, 0xC3, 0x0C, 0x46, 0x3B))
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+        gdi32 = ctypes.windll.gdi32
+        user32 = ctypes.windll.user32
+        ole32.CoInitialize(None)
+        factory = ctypes.c_void_p()
+        shell32.SHCreateItemFromParsingName.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
+        shell32.SHCreateItemFromParsingName.restype = ctypes.HRESULT
+        if shell32.SHCreateItemFromParsingName(str(path), None, ctypes.byref(iid), ctypes.byref(factory)) < 0 or not factory:
+            return None
+        obj = ctypes.cast(factory, ctypes.POINTER(IShellItemImageFactory))
+        hbitmap = wintypes.HBITMAP()
+        flags = 0x1
+        hr = obj.contents.lpVtbl.contents.GetImage(factory, SIZE(int(size), int(size)), flags, ctypes.byref(hbitmap))
+        obj.contents.lpVtbl.contents.Release(factory)
+        if hr < 0 or not hbitmap:
+            return None
+
+        bitmap = BITMAP()
+        gdi32.GetObjectW(hbitmap, ctypes.sizeof(bitmap), ctypes.byref(bitmap))
+        width = int(bitmap.bmWidth)
+        height = int(bitmap.bmHeight)
+        if width <= 0 or height <= 0:
+            gdi32.DeleteObject(hbitmap)
+            return None
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = width
+        bmi.bmiHeader.biHeight = -height
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        buffer = (ctypes.c_ubyte * (width * height * 4))()
+        hdc = user32.GetDC(None)
+        try:
+            lines = gdi32.GetDIBits(hdc, hbitmap, 0, height, ctypes.byref(buffer), ctypes.byref(bmi), 0)
+        finally:
+            user32.ReleaseDC(None, hdc)
+            gdi32.DeleteObject(hbitmap)
+        if lines == 0:
+            return None
+        image = QImage(bytes(buffer), width, height, QImage.Format_ARGB32).copy()
+        pix = QPixmap.fromImage(image)
+        return pix if not pix.isNull() else None
+    except Exception:
+        return None
 
 
 def unique_copy_target(target):
