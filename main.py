@@ -725,6 +725,8 @@ class ViewerWindow(QMainWindow):
         self.video_finished = False
         self.video_stopped_by_user = False
         self.webtoon_scroll = None
+        self.webtoon_loaded = set()
+        self.webtoon_idle_index = 0
         self.active_display_path = None
         self.video_thumbnail_cache = {}
         self.animated_image_reader = None
@@ -883,6 +885,9 @@ class ViewerWindow(QMainWindow):
         self.video_timer.timeout.connect(self.update_video_controls)
         self.animated_image_timer = QTimer(self)
         self.animated_image_timer.timeout.connect(self.advance_animated_image)
+        self.webtoon_idle_timer = QTimer(self)
+        self.webtoon_idle_timer.setInterval(120)
+        self.webtoon_idle_timer.timeout.connect(self.load_next_webtoon_idle_image)
         self.input_layer = QWidget(self.central)
         self.input_layer.setMouseTracking(True)
         self.input_layer.setStyleSheet("background: transparent;")
@@ -893,7 +898,8 @@ class ViewerWindow(QMainWindow):
         menu = QMenu(self.mode_btn)
         menu.addAction("single", lambda: self.set_viewer_mode("single"))
         double_menu = menu.addMenu("double")
-        double_menu.addAction("page", lambda: self.set_viewer_mode("double", "page"))
+        double_menu.addAction("1,2 / 3,4", lambda: self.set_viewer_mode("double", "page"))
+        double_menu.addAction("2,1 / 4,3", lambda: self.set_viewer_mode("double", "manga_page"))
         double_menu.addAction("slide", lambda: self.set_viewer_mode("double", "slide"))
         triple_menu = menu.addMenu("triple")
         triple_menu.addAction("page", lambda: self.set_viewer_mode("triple", "page"))
@@ -902,7 +908,9 @@ class ViewerWindow(QMainWindow):
         return menu
 
     def update_mode_button(self):
-        if self.viewer_mode in ("double", "triple"):
+        if self.viewer_mode == "double" and self.step_mode == "manga_page":
+            self.mode_btn.setText("double 2,1")
+        elif self.viewer_mode in ("double", "triple"):
             self.mode_btn.setText(f"{self.viewer_mode} {self.step_mode}")
         elif self.viewer_mode in ("webtoon", "webtoon_vertical"):
             self.mode_btn.setText("webtoon")
@@ -1013,11 +1021,18 @@ class ViewerWindow(QMainWindow):
             return [p for p in self.items if is_image(p)]
         else:
             size = 1
-        return self.items[self.index:self.index + size]
+        group = self.items[self.index:self.index + size]
+        if self.viewer_mode == "double" and self.step_mode == "manga_page":
+            return list(reversed(group))
+        return group
 
     def clear_grid(self):
         self.stop_media()
         self.webtoon_scroll = None
+        self.webtoon_loaded = set()
+        self.webtoon_idle_index = 0
+        if hasattr(self, "webtoon_idle_timer"):
+            self.webtoon_idle_timer.stop()
         while self.grid.count():
             item = self.grid.takeAt(0)
             widget = item.widget()
@@ -1051,6 +1066,9 @@ class ViewerWindow(QMainWindow):
                 if is_image(path):
                     label = QLabel()
                     label.setAlignment(Qt.AlignCenter)
+                    label.setMinimumHeight(120)
+                    label.setStyleSheet("background: #050505; color: #777;")
+                    label.setText(path.name)
                     layout.addWidget(label)
                     self.labels.append((label, path))
             layout.addStretch(1)
@@ -1060,9 +1078,11 @@ class ViewerWindow(QMainWindow):
             scroll.setStyleSheet("background: #050505;")
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            scroll.verticalScrollBar().valueChanged.connect(self.schedule_webtoon_visible_update)
             self.webtoon_scroll = scroll
             self.grid.addWidget(scroll, 0, 0)
-            self.schedule_image_update()
+            self.schedule_webtoon_visible_update()
+            self.webtoon_idle_timer.start()
         else:
             for col, path in enumerate(group):
                 if col in active_video_slots:
@@ -1126,8 +1146,16 @@ class ViewerWindow(QMainWindow):
             label.setToolTip(name)
 
     def schedule_image_update(self):
+        if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+            self.webtoon_loaded = set()
+            self.schedule_webtoon_visible_update()
+            return
         QTimer.singleShot(0, self.update_image_labels)
         QTimer.singleShot(40, self.update_image_labels)
+
+    def schedule_webtoon_visible_update(self):
+        QTimer.singleShot(0, self.update_webtoon_visible_images)
+        QTimer.singleShot(60, self.update_webtoon_visible_images)
 
     def create_video_frame(self):
         frame = QFrame()
@@ -1357,18 +1385,69 @@ class ViewerWindow(QMainWindow):
             self.animated_image_timer.stop()
 
     def update_image_labels(self):
+        if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+            self.webtoon_loaded = set()
+            self.update_webtoon_visible_images()
+            return
         for label, path in self.labels:
-            if self.try_start_animated_image(label, path):
+            self.load_image_label(label, path)
+
+    def load_image_label(self, label, path):
+        if self.try_start_animated_image(label, path):
+            return True
+        pix = QPixmap(str(path))
+        if pix.isNull():
+            label.setText(path.name)
+            return False
+        if self.rotation:
+            from PySide6.QtGui import QTransform
+            pix = pix.transformed(QTransform().rotate(self.rotation), Qt.SmoothTransformation)
+        target = self.target_size(label, pix)
+        label.setMinimumHeight(0)
+        label.setText("")
+        label.setPixmap(pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        return True
+
+    def visible_webtoon_indices(self, margin=2):
+        if not self.webtoon_scroll or not self.labels:
+            return []
+        viewport_top = self.webtoon_scroll.verticalScrollBar().value()
+        anchor = 0
+        for idx, (label, _) in enumerate(self.labels):
+            top = label.y()
+            bottom = top + max(1, label.height())
+            if bottom >= viewport_top:
+                anchor = idx
+                break
+        start = max(0, anchor - margin)
+        end = min(len(self.labels) - 1, anchor + margin)
+        return list(range(start, end + 1))
+
+    def update_webtoon_visible_images(self):
+        for idx in self.visible_webtoon_indices(margin=2):
+            if idx in self.webtoon_loaded:
                 continue
-            pix = QPixmap(str(path))
-            if pix.isNull():
-                label.setText(path.name)
+            label, path = self.labels[idx]
+            if self.load_image_label(label, path):
+                self.webtoon_loaded.add(idx)
+
+    def load_next_webtoon_idle_image(self):
+        if self.viewer_mode not in ("webtoon", "webtoon_vertical") or not self.labels:
+            self.webtoon_idle_timer.stop()
+            return
+        self.update_webtoon_visible_images()
+        visible = set(self.visible_webtoon_indices(margin=2))
+        for _ in range(len(self.labels)):
+            idx = self.webtoon_idle_index % len(self.labels)
+            self.webtoon_idle_index += 1
+            if idx in self.webtoon_loaded or idx in visible:
                 continue
-            if self.rotation:
-                from PySide6.QtGui import QTransform
-                pix = pix.transformed(QTransform().rotate(self.rotation), Qt.SmoothTransformation)
-            target = self.target_size(label, pix)
-            label.setPixmap(pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            label, path = self.labels[idx]
+            if self.load_image_label(label, path):
+                self.webtoon_loaded.add(idx)
+            break
+        if len(self.webtoon_loaded) >= len(self.labels):
+            self.webtoon_idle_timer.stop()
 
     def target_size(self, label, pix):
         area = self.viewer_area()
@@ -1620,7 +1699,7 @@ class ViewerWindow(QMainWindow):
             return
         self.stop_media()
         step = 1
-        if self.step_mode == "page":
+        if self.step_mode in ("page", "manga_page"):
             step = {"double": 2, "triple": 3}.get(self.viewer_mode, 1)
         self.index = min(len(self.items) - 1, self.index + step)
         self.show_current(reset=not self.zoom_locked)
@@ -1633,7 +1712,7 @@ class ViewerWindow(QMainWindow):
             return
         self.stop_media()
         step = 1
-        if self.step_mode == "page":
+        if self.step_mode in ("page", "manga_page"):
             step = {"double": 2, "triple": 3}.get(self.viewer_mode, 1)
         self.index = (self.index + step) % len(self.items)
         self.show_current(reset=not self.zoom_locked)
@@ -1670,7 +1749,7 @@ class ViewerWindow(QMainWindow):
             return
         self.stop_media()
         step = 1
-        if self.step_mode == "page":
+        if self.step_mode in ("page", "manga_page"):
             step = {"double": 2, "triple": 3}.get(self.viewer_mode, 1)
         self.index = max(0, self.index - step)
         self.show_current(reset=not self.zoom_locked)
