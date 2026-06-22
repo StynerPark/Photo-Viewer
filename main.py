@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 APP_NAME = "Portable Media Viewer"
+DEFAULT_LAST_FOLDER_SETTING = r"%USERPROFILE%\Documents"
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 RUN_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 SETTINGS_PATH = RUN_DIR / "settings.json"
@@ -90,7 +91,7 @@ ARCHIVE_EXTS = {".zip"}
 
 
 DEFAULT_SETTINGS = {
-    "last_folder": str(DEFAULT_START_FOLDER),
+    "last_folder": DEFAULT_LAST_FOLDER_SETTING,
     "view_mode": "large",
     "sort_mode": "name_asc",
     "viewer_mode": "single",
@@ -330,7 +331,7 @@ class ThumbList(QListWidget):
         self.setStyleSheet("""
             QListWidget { background: #050505; }
             QListWidget::item { background: #050505; color: #f0f0f0; padding: 4px; }
-            QListWidget::item:selected { background: #5a1470; color: #ffffff; border: 1px solid #9d6fff; }
+            QListWidget::item:selected { background: #8f72b8; color: #ffffff; border: 1px solid #c7b5e8; }
             QListWidget::item:hover { background: #303030; }
         """)
 
@@ -436,7 +437,7 @@ class DetailsTable(QTableWidget):
         self.sort_column = 0
         self.sort_ascending = True
         self.setStyleSheet("""
-            QTableWidget::item:selected { background: #5a1470; color: #ffffff; }
+            QTableWidget::item:selected { background: #8f72b8; color: #ffffff; }
         """)
 
     def load_entries(self, entries, icon_provider, make_icon, lightweight=False):
@@ -1949,7 +1950,7 @@ class MainWindow(QMainWindow):
             self.current_folder = DEFAULT_START_FOLDER
         if not self.safe_is_dir(self.current_folder):
             self.current_folder = DEFAULT_START_FOLDER
-        self.settings["last_folder"] = str(DEFAULT_START_FOLDER)
+        self.settings["last_folder"] = DEFAULT_LAST_FOLDER_SETTING
         save_settings(self.settings)
         self.media_paths = []
         self.viewer = None
@@ -2155,8 +2156,8 @@ class MainWindow(QMainWindow):
         if self.settings.get("theme", "dark") == "light":
             self.setStyleSheet("""
                 QMainWindow, QWidget { background: #f2f2f2; color: #161616; }
-            QTreeView, QListWidget, QTableWidget { background: #ffffff; color: #151515; selection-background-color: #7d4aa3; selection-color: white; }
-            QListWidget::item:selected, QTableWidget::item:selected { background: #7d4aa3; color: white; border: 1px solid #ad78d1; }
+            QTreeView, QListWidget, QTableWidget { background: #ffffff; color: #151515; selection-background-color: #bda7dc; selection-color: white; }
+            QListWidget::item:selected, QTableWidget::item:selected { background: #bda7dc; color: white; border: 1px solid #d7c8f0; }
                 QHeaderView::section { background: #e2e2e2; color: #151515; border: 1px solid #c8c8c8; padding: 4px; }
                 QLineEdit { background: #ffffff; color: #151515; border: 1px solid #b8b8b8; padding: 5px 8px; }
                 QToolButton, QPushButton, QComboBox { background: #e4e4e4; color: #151515; border: 1px solid #b8b8b8; padding: 4px 9px; }
@@ -2166,8 +2167,8 @@ class MainWindow(QMainWindow):
         else:
             self.setStyleSheet("""
                 QMainWindow, QWidget { background: #1e1e1e; color: #f0f0f0; }
-            QTreeView, QListWidget, QTableWidget { background: #242424; color: #f0f0f0; selection-background-color: #5a1470; selection-color: white; }
-            QListWidget::item:selected, QTableWidget::item:selected { background: #5a1470; color: white; border: 1px solid #9d6fff; }
+            QTreeView, QListWidget, QTableWidget { background: #242424; color: #f0f0f0; selection-background-color: #8f72b8; selection-color: white; }
+            QListWidget::item:selected, QTableWidget::item:selected { background: #8f72b8; color: white; border: 1px solid #c7b5e8; }
                 QHeaderView::section { background: #3a3a3a; color: #f0f0f0; border: 1px solid #555; padding: 4px; }
                 QLineEdit { background: #262626; color: #f0f0f0; border: 1px solid #444; padding: 5px 8px; }
                 QToolButton, QPushButton, QComboBox { background: #3a3a3a; color: #f0f0f0; border: 1px solid #555; padding: 4px 9px; }
@@ -3279,6 +3280,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         path = self.selected_primary_path()
         menu.addAction("Open Viewer (&V)", self.open_selected_viewer)
+        if path.is_dir():
+            menu.addAction("Add Shortcut (&S)", lambda p=path: self.add_quick_path(str(p)))
         menu.addSeparator()
         menu.addAction("Open in Windows (&E)", lambda p=path: self.open_in_explorer(p))
         menu.addSeparator()
@@ -3300,6 +3303,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         path = self.selected_primary_path()
         menu.addAction("Open Viewer (&V)", self.open_selected_viewer)
+        if path.is_dir():
+            menu.addAction("Add Shortcut (&S)", lambda p=path: self.add_quick_path(str(p)))
         menu.addSeparator()
         menu.addAction("Open in Windows (&E)", lambda p=path: self.open_in_explorer(p))
         menu.addSeparator()
