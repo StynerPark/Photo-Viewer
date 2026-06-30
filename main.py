@@ -12,7 +12,8 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-APP_NAME = "Portable Media Viewer"
+APP_NAME = "Portable Photo Viewer"
+INSTANCE_SERVER_NAME = "StynerPark_PortableMediaViewer_Instance"
 DEFAULT_LAST_FOLDER_SETTING = r"%USERPROFILE%\Documents"
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 RUN_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -33,7 +34,8 @@ if not DEFAULT_START_FOLDER.exists():
 from PIL import Image
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QAbstractNativeEventFilter, QDir, QEvent, QFileInfo, QFileSystemWatcher, QMimeData, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QKeySequence, QMovie, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QKeySequence, QMovie, QPainter, QPixmap, QShortcut
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -79,8 +81,11 @@ except Exception:
 
 
 IMAGE_EXTS = {
-    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff",
-    ".ico", ".ppm", ".pgm", ".pbm", ".pnm", ".jfif",
+    ".jpg", ".jpeg", ".jpe", ".png", ".apng", ".bmp", ".gif", ".webp",
+    ".avif", ".avifs", ".tif", ".tiff", ".ico", ".ppm", ".pgm", ".pbm",
+    ".pnm", ".jfif", ".jp2", ".j2k", ".j2c", ".jpc", ".jpf", ".jpx",
+    ".tga", ".icb", ".vda", ".vst", ".dds", ".psd", ".pcx", ".qoi",
+    ".sgi", ".rgb", ".rgba", ".bw", ".ras", ".xbm", ".xpm",
 }
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv", ".m4v",
@@ -88,6 +93,8 @@ VIDEO_EXTS = {
 }
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 ARCHIVE_EXTS = {".zip"}
+WEBTOON_MIN_WIDTH = 320
+WEBTOON_MAX_WIDTH = 3840
 
 
 DEFAULT_SETTINGS = {
@@ -99,6 +106,7 @@ DEFAULT_SETTINGS = {
     "default_fit": "fit_height",
     "zoom_locked": True,
     "theme": "dark",
+    "instance_mode": "multi",
     "quick_paths": [],
     "geometry": {},
     "shortcuts": {
@@ -727,6 +735,9 @@ class ViewerWindow(QMainWindow):
         self.webtoon_scroll = None
         self.webtoon_loaded = set()
         self.webtoon_idle_index = 0
+        self.webtoon_target_width = None
+        self.webtoon_pixmap_cache = {}
+        self.webtoon_pixmap_cache_order = []
         self.active_display_path = None
         self.video_thumbnail_cache = {}
         self.animated_image_reader = None
@@ -1058,6 +1069,8 @@ class ViewerWindow(QMainWindow):
         active_video_slots = self.active_video_slots_for_group(group)
         self.current_is_video = bool(active_video_slots)
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+            reference = self.items[self.index] if self.items and is_image(self.items[self.index]) else (group[0] if group else None)
+            self.reset_webtoon_target_width(reference)
             container = QWidget()
             layout = QVBoxLayout(container)
             layout.setContentsMargins(0, 0, 0, 0)
@@ -1147,7 +1160,7 @@ class ViewerWindow(QMainWindow):
 
     def schedule_image_update(self):
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
-            self.webtoon_loaded = set()
+            self.reset_webtoon_target_width()
             self.schedule_webtoon_visible_update()
             return
         QTimer.singleShot(0, self.update_image_labels)
@@ -1156,6 +1169,78 @@ class ViewerWindow(QMainWindow):
     def schedule_webtoon_visible_update(self):
         QTimer.singleShot(0, self.update_webtoon_visible_images)
         QTimer.singleShot(60, self.update_webtoon_visible_images)
+
+    def image_pixel_size(self, path):
+        reader = QImageReader(str(path))
+        size = reader.size()
+        if size.isValid() and size.width() > 0 and size.height() > 0:
+            return size
+        pix = QPixmap(str(path))
+        return pix.size()
+
+    def reference_webtoon_path(self):
+        if not self.labels:
+            return self.items[self.index] if self.items else None
+        indices = self.visible_webtoon_indices(margin=0)
+        if indices:
+            return self.labels[indices[0]][1]
+        for _, path in self.labels:
+            if path == self.items[self.index]:
+                return path
+        return self.labels[0][1]
+
+    def compute_webtoon_target_width(self, reference_path=None):
+        reference_path = reference_path or self.reference_webtoon_path()
+        area_width = max(1, self.viewer_area().width())
+        if reference_path and self.fit_mode in ("actual", "manual"):
+            size = self.image_pixel_size(reference_path)
+            if size.isValid() and size.width() > 0:
+                width = size.width()
+                if self.fit_mode == "manual":
+                    width = int(width * self.zoom_factor)
+            else:
+                width = area_width
+        else:
+            width = area_width
+        return max(WEBTOON_MIN_WIDTH, min(WEBTOON_MAX_WIDTH, int(width)))
+
+    def reset_webtoon_target_width(self, reference_path=None):
+        self.webtoon_target_width = self.compute_webtoon_target_width(reference_path)
+        self.webtoon_loaded = set()
+
+    def scaled_static_pixmap(self, path, target_width):
+        path = Path(path)
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            mtime = 0
+        key = (str(path), int(target_width), int(self.rotation), mtime)
+        cached = self.webtoon_pixmap_cache.get(key)
+        if cached is not None:
+            return cached
+        reader = QImageReader(str(path))
+        source_size = reader.size()
+        if source_size.isValid() and source_size.width() > 0 and source_size.height() > 0:
+            target_height = max(1, int(source_size.height() * target_width / source_size.width()))
+            reader.setScaledSize(QSize(max(1, int(target_width)), target_height))
+            image = reader.read()
+            pix = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+        else:
+            pix = QPixmap(str(path))
+            if not pix.isNull() and pix.width() > 0:
+                target_height = max(1, int(pix.height() * target_width / pix.width()))
+                pix = pix.scaled(max(1, int(target_width)), target_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        if pix.isNull():
+            return pix
+        if self.rotation:
+            from PySide6.QtGui import QTransform
+            pix = pix.transformed(QTransform().rotate(self.rotation), Qt.SmoothTransformation)
+        self.webtoon_pixmap_cache[key] = pix
+        self.webtoon_pixmap_cache_order.append(key)
+        while len(self.webtoon_pixmap_cache_order) > 48:
+            old_key = self.webtoon_pixmap_cache_order.pop(0)
+            self.webtoon_pixmap_cache.pop(old_key, None)
+        return pix
 
     def create_video_frame(self):
         frame = QFrame()
@@ -1395,6 +1480,17 @@ class ViewerWindow(QMainWindow):
     def load_image_label(self, label, path):
         if self.try_start_animated_image(label, path):
             return True
+        if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+            if self.webtoon_target_width is None:
+                self.reset_webtoon_target_width(path)
+            pix = self.scaled_static_pixmap(path, self.webtoon_target_width)
+            if pix.isNull():
+                label.setText(path.name)
+                return False
+            label.setMinimumHeight(0)
+            label.setText("")
+            label.setPixmap(pix)
+            return True
         pix = QPixmap(str(path))
         if pix.isNull():
             label.setText(path.name)
@@ -1452,11 +1548,11 @@ class ViewerWindow(QMainWindow):
     def target_size(self, label, pix):
         area = self.viewer_area()
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
-            if self.fit_mode == "actual":
-                return pix.size()
-            if self.fit_mode == "manual":
-                return QSize(max(1, int(pix.width() * self.zoom_factor)), max(1, int(pix.height() * self.zoom_factor)))
-            width = area.width()
+            if self.webtoon_target_width is None:
+                self.webtoon_target_width = self.compute_webtoon_target_width()
+            width = max(1, int(self.webtoon_target_width))
+            if pix.width() <= 0:
+                return QSize(width, max(1, pix.height()))
             return QSize(width, max(1, int(pix.height() * width / pix.width())))
         if self.fit_mode == "fit_width":
             base = QSize(area.width(), max(1, int(pix.height() * area.width() / pix.width())))
@@ -1808,6 +1904,11 @@ class ViewerWindow(QMainWindow):
 
     def current_display_scale(self):
         for _, path in self.labels:
+            if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+                size = self.image_pixel_size(path)
+                if size.isValid() and size.width() > 0:
+                    width = self.webtoon_target_width or self.compute_webtoon_target_width(path)
+                    return max(0.05, min(10.0, width / size.width()))
             pix = QPixmap(str(path))
             if pix.isNull():
                 continue
@@ -1986,6 +2087,11 @@ class ShortcutDialog(QDialog):
         self.theme_combo.setCurrentText(settings.get("theme", "dark"))
         self.theme_combo.currentTextChanged.connect(self.set_theme)
         form.addRow("theme", self.theme_combo)
+        self.instance_combo = QComboBox()
+        self.instance_combo.addItems(["multi", "single"])
+        self.instance_combo.setCurrentText(settings.get("instance_mode", "multi"))
+        self.instance_combo.currentTextChanged.connect(self.set_instance_mode)
+        form.addRow("instance mode", self.instance_combo)
         for action, values in sorted(settings.get("shortcuts", {}).items()):
             edit_btn = QPushButton(", ".join(values))
             edit_btn.clicked.connect(lambda checked=False, a=action: self.edit_action(a))
@@ -2011,6 +2117,10 @@ class ShortcutDialog(QDialog):
 
     def set_theme(self, theme):
         self.settings["theme"] = theme
+        save_settings(self.settings)
+
+    def set_instance_mode(self, mode):
+        self.settings["instance_mode"] = mode
         save_settings(self.settings)
 
 
@@ -2636,7 +2746,7 @@ class MainWindow(QMainWindow):
                 self.details.load_entries(entries, self.icon_provider, self.make_icon, lightweight=lightweight)
             else:
                 for entry in entries:
-                    item = QListWidgetItem(entry.path.name)
+                    item = QListWidgetItem(entry.display_name)
                     item.setData(Qt.UserRole, str(entry.path))
                     item.setToolTip(str(entry.path))
                     item.setIcon(self.entry_icon(entry, lightweight=lightweight))
@@ -2845,7 +2955,7 @@ class MainWindow(QMainWindow):
 
     def sorted_entries(self, entries, sort_mode, ascending):
         def key_name(item):
-            return item.path.name.lower()
+            return item.display_name.lower()
 
         def stat_value(item, attr):
             try:
@@ -2999,6 +3109,32 @@ class MainWindow(QMainWindow):
     def open_startup_media(self):
         if self.startup_media_path and self.startup_media_path.exists():
             self.open_viewer_for(self.startup_media_path)
+
+    def activate_from_external_request(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def open_external_request(self, path_text=None):
+        self.activate_from_external_request()
+        if not path_text:
+            return
+        path_text = str(path_text).strip().strip('"')
+        if not path_text:
+            return
+        path = Path(path_text)
+        if self.viewer:
+            self.exit_viewer_mode()
+        if path.is_file() and is_media(path):
+            if self.load_folder(path.parent):
+                self.open_viewer_for(path)
+        elif path.is_dir():
+            self.load_folder(path)
+        elif path.is_file() and is_archive(path):
+            self.open_archive(path)
+        else:
+            QMessageBox.warning(self, "Invalid path", f"Cannot open this path:\n{path_text}")
 
     def open_archive(self, archive_path, add_history=True):
         archive_path = Path(archive_path)
@@ -3598,13 +3734,75 @@ def path_contains(parent, child):
         return False
 
 
+def send_to_existing_instance(path_text=None):
+    socket = QLocalSocket()
+    socket.connectToServer(INSTANCE_SERVER_NAME)
+    if not socket.waitForConnected(250):
+        return False
+    payload = json.dumps({"path": path_text or ""}, ensure_ascii=False).encode("utf-8")
+    socket.write(payload)
+    socket.flush()
+    socket.waitForBytesWritten(250)
+    socket.disconnectFromServer()
+    socket.waitForDisconnected(250)
+    return True
+
+
+def start_instance_server(window):
+    server = QLocalServer(window)
+    if not server.listen(INSTANCE_SERVER_NAME):
+        probe = QLocalSocket()
+        probe.connectToServer(INSTANCE_SERVER_NAME)
+        if probe.waitForConnected(100):
+            probe.disconnectFromServer()
+            return None
+        QLocalServer.removeServer(INSTANCE_SERVER_NAME)
+        if not server.listen(INSTANCE_SERVER_NAME):
+            return None
+
+    def handle_connection():
+        while server.hasPendingConnections():
+            connection = server.nextPendingConnection()
+            connection._pmv_handled = False
+
+            def read_request(conn=connection):
+                if getattr(conn, "_pmv_handled", False):
+                    return
+                if conn.bytesAvailable() <= 0:
+                    if conn.state() == QLocalSocket.UnconnectedState:
+                        conn.deleteLater()
+                    return
+                conn._pmv_handled = True
+                try:
+                    data = bytes(conn.readAll()).decode("utf-8", errors="replace")
+                    payload = json.loads(data) if data else {}
+                    window.open_external_request(payload.get("path") or None)
+                except Exception:
+                    window.open_external_request(None)
+                finally:
+                    conn.disconnectFromServer()
+                    conn.deleteLater()
+
+            connection.readyRead.connect(read_request)
+            connection.disconnected.connect(read_request)
+            if connection.bytesAvailable():
+                QTimer.singleShot(0, read_request)
+
+    server.newConnection.connect(handle_connection)
+    return server
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     app.setWindowIcon(app_icon())
     startup_path = sys.argv[1] if len(sys.argv) > 1 else None
+    settings = load_settings()
+    if settings.get("instance_mode", "multi") == "single" and send_to_existing_instance(startup_path):
+        return
     win = MainWindow(startup_path=startup_path)
+    win.instance_server = start_instance_server(win)
     win.show()
     sys.exit(app.exec())
 

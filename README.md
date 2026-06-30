@@ -1,26 +1,15 @@
-# Portable Media Viewer
+# Portable Photo Viewer
 
-> Built with assistance from OpenAI Codex.  
-> OpenAI Codex의 도움을 받아 제작되었습니다.
+Portable Photo Viewer is a Windows portable photo-first viewer and folder browser.
+It is built for fast local photo browsing, full-screen viewing, webtoon-style
+vertical reading, and Japanese manga-style two-page reading. Animated images and
+common video files such as MP4 are supported as companion media, but the main
+identity of the app is a photo viewer.
 
-Portable Media Viewer is a Windows portable image, animated image, video, and
-archive browser. It is designed for fast folder navigation and a full-screen
-viewer workflow without installing a desktop app.
-
-Windows용 포터블 이미지, 움짤, 동영상, 압축파일 브라우저입니다. 빠른 폴더 탐색과
-전체화면 뷰어 흐름을 목표로 만들었습니다.
-
-## Screenshots / 스크린샷
-
-![Portable Media Viewer browser](screenshots/browser.png)
-
-Folder and thumbnail browser for quickly navigating local image collections.  
-로컬 이미지 폴더를 빠르게 탐색할 수 있는 폴더 트리와 썸네일 브라우저 화면입니다.
-
-![Portable Media Viewer viewing modes](screenshots/viewer-modes.png)
-
-Viewer mode with single-image, two-page comic/book, three-page, and vertical webtoon-style layouts.  
-단일 사진 보기, 2분할 만화책 보기, 3분할 보기, 세로 웹툰 스크롤 보기 모드를 지원하는 이미지 보기 화면입니다.
+Portable Photo Viewer는 사진 감상 중심의 Windows 포터블 뷰어입니다. 빠른 폴더 탐색,
+전체화면 감상, 웹툰형 세로 스크롤, 일본 만화식 2페이지 보기를 강점으로 합니다.
+GIF/WebP/APNG 움짤과 MP4 같은 영상 파일도 함께 볼 수 있지만, 기본 성격은 사진
+뷰어입니다.
 
 ## Download
 
@@ -30,120 +19,103 @@ https://github.com/StynerPark/Portable-image-Viewer/releases
 
 Extract the zip file and run `PortableMediaViewer.exe`.
 
-## Korean Guide
+압축을 풀고 `PortableMediaViewer.exe`를 실행하면 됩니다.
 
-### 주요 기능
+## Supported Formats / 지원 확장자
 
-- Windows 폴더 트리 기반 탐색기
-- 폴더 / 바로가기 / 파일 목록 패널
-- 썸네일, 리스트, 디테일 보기 모드
-- 이름, 크기, 종류, 수정일 기준 정렬
-- 이미지, GIF, animated WebP, 동영상 파일을 섞어서 탐색 및 재생
-- ZIP 파일을 폴더처럼 열어서 내부 이미지 보기
-- VLC/libVLC 기반 동영상 재생
-- 단일, 2분할, 3분할, 웹툰 스크롤 뷰어 모드
-- 높이 맞춤, 너비 맞춤, 창 맞춤, 원본 크기, 수동 확대
-- 확대 비율 잠금 및 해제
-- 이미지 회전: 왼쪽 90도, 0도 초기화, 오른쪽 90도
-- 탐색기/뷰어에서 복사, 붙여넣기, 삭제 지원
-- 라이트 모드 / 다크 모드
-- 설정값은 portable 폴더의 `settings.json`에 저장
+Photo and image formats:
 
-### 실행 방식
+`jpg`, `jpeg`, `jpe`, `png`, `apng`, `bmp`, `gif`, `webp`, `avif`, `avifs`,
+`tif`, `tiff`, `ico`, `jfif`, `ppm`, `pgm`, `pbm`, `pnm`, `jp2`, `j2k`,
+`j2c`, `jpc`, `jpf`, `jpx`, `tga`, `icb`, `vda`, `vst`, `dds`, `psd`, `pcx`,
+`qoi`, `sgi`, `rgb`, `rgba`, `bw`, `ras`, `xbm`, `xpm`
 
-- 프로그램을 그냥 실행하면 기본 시작 폴더에서 탐색기 모드로 열립니다.
-- 이미지/GIF/WebP/동영상을 Windows 기본 앱으로 연결한 뒤 더블클릭하면 바로 뷰어 모드로 열립니다.
-- 이 경우 뷰어를 닫으면 해당 파일이 있던 폴더 위치로 돌아갑니다.
-- 마지막으로 열었던 폴더는 기본 실행 시 자동 복원하지 않습니다. 다른 사람이 실행했을 때 이전 사진 위치가 바로 노출되지 않게 하기 위한 동작입니다.
+Animated image formats:
 
-### 뷰어 모드
+`gif`, `webp`, `apng`
 
-- 파일을 더블클릭하거나 `Enter`를 누르면 뷰어 모드로 들어갑니다.
-- 뷰어 모드에서는 전체화면이 기본입니다.
-- 빈 공간을 더블클릭하면 탐색기 모드로 돌아갑니다.
-- 상단/하단 컨트롤은 마우스를 해당 영역 근처로 가져가면 잠시 표시됩니다.
-- 동영상은 하단 팝업 컨트롤에서 재생/정지, 재생바 이동, 시간 표시, 볼륨 조절을 할 수 있습니다.
-- GIF와 animated WebP는 큰 파일에서도 다음 파일로 넘어갈 때 멈춤이 적도록 순차 디코딩 방식으로 재생합니다.
+Video formats:
 
-### 기본 단축키
+`mp4`, `mkv`, `avi`, `mov`, `webm`, `wmv`, `flv`, `m4v`, `mpeg`, `mpg`, `ts`,
+`m2ts`, `3gp`, `ogv`
 
-| 동작 | 기본 단축키 |
-| --- | --- |
-| 뷰어 열기 | `Enter` |
-| 전체화면 전환 | `F11`, 마우스 휠 버튼 |
-| 다음 파일 | 마우스 휠 아래, `PageDown` |
-| 이전 파일 | 마우스 휠 위, `PageUp` |
-| 첫 파일 | `Home` |
-| 마지막 파일 | `End` |
-| 스페이스 이동 | `Space` |
-| 확대 | `+`, `Ctrl++` |
-| 축소 | `-`, `Ctrl+-` |
-| 높이 맞춤 | `H` |
-| 너비 맞춤 | `W` |
-| 원본 크기 | `1` |
-| 확대 잠금 전환 | `L` |
-| 오른쪽 회전 | `R` |
-| 왼쪽 회전 | `Shift+R` |
-| 뒤로 | `Alt+Left`, 마우스 뒤로 버튼 |
-| 앞으로 | `Alt+Right`, 마우스 앞으로 버튼 |
-| 이름 변경 | `F2` |
-| 복사 | `Ctrl+C` |
-| 붙여넣기 | `Ctrl+V` |
-| 삭제 | `Delete` |
-| 설정 열기 | `F1` |
+Archive browsing:
 
-`Space`는 이미지 뷰어에서는 다음 파일로 이동하며, 마지막 파일에서 누르면 처음 파일로 돌아갑니다. 동영상 재생 중에는 동영상 플레이어의 재생/일시정지 동작과 충돌할 수 있어 영상 조작을 우선합니다.
+`zip`
 
-### 숨겨진 설정
+Notes:
 
-설정 버튼은 기본 화면에 따로 크게 노출하지 않았습니다. `F1`을 누르면 설정 창이 열립니다.
+- HEIC/HEIF is not enabled yet because the current bundled image stack does not
+  include a HEIC decoder.
+- PDF/SVG/EPS/WMF/EMF are intentionally not listed as photo formats yet because
+  their behavior is closer to document/vector viewing than photo viewing.
+- PSD support is intended for flattened preview-style viewing, not full layer
+  editing.
 
-설정 창에서 다음 항목을 바꿀 수 있습니다.
-
-- 라이트 모드 / 다크 모드
-- 각 기능별 키보드 단축키
-- 마우스 입력 토큰: `MouseMiddle`, `MouseBack`, `MouseForward`, `WheelUp`, `WheelDown`
-- 하나의 기능에 여러 단축키 지정 가능
-- 키보드와 마우스 단축키를 동시에 지정 가능
-
-변경된 설정은 `settings.json`에 저장됩니다. 일부 단축키 바인딩은 재시작 후 완전히 반영됩니다.
-
-## English Guide
-
-### Features
+## Main Features / 주요 기능
 
 - Windows-style folder tree navigation
-- Folder, shortcut, and file browser panes
-- Thumbnail, list, and details view modes
-- Sort by name, size, type, and modified date
-- Mixed image, GIF, animated WebP, and video browsing
-- Open ZIP archives like folders for image viewing
-- VLC/libVLC video playback
-- Single, double, triple, and webtoon scrolling viewer modes
-- Fit height, fit width, fit window, actual size, and manual zoom
-- Zoom lock/unlock
-- Image rotation: left 90 degrees, reset to 0 degrees, right 90 degrees
-- Copy, paste, and delete in explorer and viewer modes
-- Light and dark themes
-- Portable settings saved in `settings.json`
+- Local folders, app-only shortcuts, and tabbed folder browsing
+- Thumbnail, list, details, and icon-style explorer views
+- Sort by name, size, type, modified date, and image properties
+- Direct address input, including local paths and SMB/UNC paths such as `\\server`
+- ZIP files open like folders for image viewing
+- Viewer mode opens from double-click or `Enter`
+- Full-screen photo viewing with mouse wheel/page navigation
+- Single, double, triple, and webtoon viewer modes
+- Japanese manga-style double page order: `2,1 / 4,3`
+- Webtoon mode with vertical continuous scrolling
+- Webtoon loading optimized with visible-range priority, fixed target width, 4K
+  width cap, scaled decoding, and memory cache
+- GIF, animated WebP, and APNG support
+- Video playback through VLC/libVLC with play/stop, seek, time, and volume controls
+- Copy, paste, rename, delete, and recycle-bin deletion in explorer and viewer modes
+- Light/dark theme
+- Multi-instance and single-instance launch modes
+- Portable settings saved next to the executable in `settings.json`
 
-### Opening Files
+## Viewer Modes / 뷰어 모드
 
-- Launching the app normally opens the default start folder in explorer mode.
-- If you associate image/video extensions with this app in Windows, double-clicking a media file opens directly in viewer mode.
-- When leaving viewer mode, the explorer returns to the folder that contains the opened file.
-- The app intentionally does not restore the last viewed folder on normal startup, so private image locations are not exposed automatically.
+- `single`: one file at a time
+- `double page`: `1,2 / 3,4`
+- `double manga`: `2,1 / 4,3`
+- `double slide`: `1,2 / 2,3 / 3,4`
+- `triple page`: `1,2,3 / 4,5,6`
+- `triple slide`: `1,2,3 / 2,3,4 / 3,4,5`
+- `webtoon`: vertical continuous scrolling
 
-### Viewer Mode
+In split modes, video files show a preview/first-frame style tile when they are
+not the active playback slot. The active slot can play video while surrounding
+items remain as previews.
 
-- Double-click a file or press `Enter` to enter viewer mode.
-- Viewer mode is full-screen by default.
-- Double-click empty viewer space to return to explorer mode.
-- Top and bottom controls appear briefly when the mouse is near the control areas.
-- Video controls appear at the bottom: play/stop, seek bar, time display, and volume.
-- GIF and animated WebP playback uses incremental frame decoding to reduce freezes when moving between files.
+## Opening Files / 파일 열기
 
-### Default Shortcuts
+- Launching the app normally opens the default Documents folder.
+- Opening an associated image/video file from Windows opens directly in viewer mode.
+- Leaving viewer mode returns to the folder that contains the opened file.
+- Normal startup does not restore the last private folder, so previous photo
+  locations are not exposed automatically.
+- In `single` instance mode, opening another file while the app is already open
+  reuses the existing window instead of starting another copy.
+
+## Settings / 설정
+
+The settings window is intentionally hidden from the main toolbar. Press `F1` to
+open it.
+
+설정창은 기본 화면에 버튼으로 노출하지 않습니다. `F1`을 누르면 열립니다.
+
+You can change:
+
+- Theme: `dark` or `light`
+- Instance mode: `multi` or `single`
+- Keyboard shortcuts
+- Mouse shortcut tokens: `MouseMiddle`, `MouseBack`, `MouseForward`, `WheelUp`, `WheelDown`
+- Multiple shortcuts for the same action
+
+Some shortcut changes require restarting the app to rebuild bindings.
+
+## Default Shortcuts / 기본 단축키
 
 | Action | Default shortcut |
 | --- | --- |
@@ -153,7 +125,7 @@ Extract the zip file and run `PortableMediaViewer.exe`.
 | Previous file | mouse wheel up, `PageUp` |
 | First file | `Home` |
 | Last file | `End` |
-| Space navigation | `Space` |
+| Next image with wrap | `Space` |
 | Zoom in | `+`, `Ctrl++` |
 | Zoom out | `-`, `Ctrl+-` |
 | Fit height | `H` |
@@ -170,21 +142,22 @@ Extract the zip file and run `PortableMediaViewer.exe`.
 | Delete | `Delete` |
 | Open settings | `F1` |
 
-In image viewer mode, `Space` moves to the next file and wraps from the last file back to the first. During video playback, video play/pause behavior may take priority.
+In image viewer mode, `Space` moves to the next file and wraps from the last file
+back to the first. During video playback, video play/pause behavior can take
+priority.
 
-### Hidden Settings
+## Portable Files / 포터블 구성
 
-The settings UI is intentionally hidden from the main toolbar. Press `F1` to open it.
+The portable release includes:
 
-In settings, you can change:
+- `PortableMediaViewer.exe`
+- `_internal`
+- `vlc`
+- `README.md`
+- `settings.json`
+- `settings.example.json`
 
-- Light/dark theme
-- Keyboard shortcuts per action
-- Mouse shortcut tokens: `MouseMiddle`, `MouseBack`, `MouseForward`, `WheelUp`, `WheelDown`
-- Multiple shortcuts for the same action
-- Keyboard and mouse shortcuts at the same time
-
-Settings are saved in `settings.json`. Some shortcut binding changes require restarting the app.
+Keep these files together. The VLC runtime is required for broad video playback.
 
 ## Run From Source
 
@@ -201,10 +174,7 @@ python main.py
 ```
 
 For video playback, place a VLC/libVLC runtime folder named `vlc` next to
-`main.py`. The VLC runtime is intentionally not committed to this repository.
-
-Runtime settings are created as `settings.json` on first use. See
-`settings.example.json` for the default structure.
+`main.py`.
 
 ## Build
 

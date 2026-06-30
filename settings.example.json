@@ -7,6 +7,7 @@
   "default_fit": "fit_height",
   "zoom_locked": true,
   "theme": "dark",
+  "instance_mode": "multi",
   "quick_paths": [],
   "geometry": {},
   "shortcuts": {
