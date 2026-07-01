@@ -74,6 +74,14 @@ Notes:
 - Multi-instance and single-instance launch modes
 - Portable settings saved next to the executable in `settings.json`
 
+## Recent Improvements
+
+- Reduced white flashes and transient child-window artifacts during fast viewer navigation.
+- Improved MP4 startup responsiveness on low-end PCs by prioritizing active playback before video thumbnail work.
+- Delayed non-active split-view video thumbnail generation so playback can begin sooner.
+- Skipped video files from adjacent viewer preload queues to reduce CPU and disk pressure while browsing quickly.
+- Kept split-view video previews available while avoiding unnecessary first-load thumbnail extraction for the active video slot.
+
 ## Viewer Modes / 뷰어 모드
 
 - `single`: one file at a time

@@ -34,7 +34,7 @@ if not DEFAULT_START_FOLDER.exists():
 from PIL import Image
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QAbstractNativeEventFilter, QDir, QEvent, QFileInfo, QFileSystemWatcher, QMimeData, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QKeySequence, QMovie, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QKeySequence, QMovie, QPainter, QPalette, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -738,6 +738,11 @@ class ViewerWindow(QMainWindow):
         self.webtoon_target_width = None
         self.webtoon_pixmap_cache = {}
         self.webtoon_pixmap_cache_order = []
+        self.viewer_pixmap_cache = {}
+        self.viewer_pixmap_cache_order = []
+        self.viewer_preload_queue = []
+        self.viewer_preload_queued = set()
+        self.render_generation = 0
         self.active_display_path = None
         self.video_thumbnail_cache = {}
         self.animated_image_reader = None
@@ -754,15 +759,30 @@ class ViewerWindow(QMainWindow):
         self._init_vlc()
 
     def _build_ui(self):
+        self.setStyleSheet("QMainWindow { background: #050505; }")
+        palette = self.palette()
+        palette.setColor(QPalette.Window, QColor("#050505"))
+        self.setPalette(palette)
+        self.setAutoFillBackground(True)
         self.central = QWidget()
+        self.central.setObjectName("viewerCentral")
         self.central.setMouseTracking(True)
+        self.central.setAttribute(Qt.WA_StyledBackground, True)
+        self.central.setAutoFillBackground(True)
+        central_palette = self.central.palette()
+        central_palette.setColor(QPalette.Window, QColor("#050505"))
+        self.central.setPalette(central_palette)
+        self.central.setStyleSheet("#viewerCentral { background: #050505; }")
         self.grid = QGridLayout(self.central)
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setSpacing(0)
         self.setCentralWidget(self.central)
         self.labels = []
         self.video_frame = QFrame()
+        self.video_frame.setObjectName("videoFrame")
+        self.video_frame.setAttribute(Qt.WA_StyledBackground, True)
         self.video_frame.setStyleSheet("background: #000;")
+        self.video_frame.setAutoFillBackground(True)
         self.video_frame.setFocusPolicy(Qt.StrongFocus)
         self.video_frame.setMouseTracking(True)
         self.central.setFocusPolicy(Qt.StrongFocus)
@@ -899,8 +919,13 @@ class ViewerWindow(QMainWindow):
         self.webtoon_idle_timer = QTimer(self)
         self.webtoon_idle_timer.setInterval(120)
         self.webtoon_idle_timer.timeout.connect(self.load_next_webtoon_idle_image)
+        self.viewer_preload_timer = QTimer(self)
+        self.viewer_preload_timer.setInterval(55)
+        self.viewer_preload_timer.timeout.connect(self.process_next_viewer_preload)
         self.input_layer = QWidget(self.central)
+        self.input_layer.setObjectName("viewerInputLayer")
         self.input_layer.setMouseTracking(True)
+        self.input_layer.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.input_layer.setStyleSheet("background: transparent;")
         self.input_layer.installEventFilter(self)
         self.input_layer.raise_()
@@ -1048,30 +1073,171 @@ class ViewerWindow(QMainWindow):
             item = self.grid.takeAt(0)
             widget = item.widget()
             if widget:
-                widget.setParent(None)
+                if widget is self.video_frame:
+                    widget.hide()
+                else:
+                    widget.hide()
+                    widget.deleteLater()
         self.labels = []
 
+    def is_animated_image_path(self, path):
+        return Path(path).suffix.lower() in (".gif", ".webp", ".apng")
+
+    def viewer_pixmap_cache_key(self, path):
+        path = Path(path)
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            mtime = 0
+        area = self.viewer_area()
+        return (
+            str(path),
+            mtime,
+            self.viewer_mode,
+            self.step_mode,
+            self.fit_mode,
+            round(float(self.zoom_factor), 4),
+            int(self.rotation),
+            area.width(),
+            area.height(),
+        )
+
+    def first_animated_frame_pixmap(self, path):
+        reader = None
+        try:
+            reader = Image.open(path)
+            reader.seek(0)
+            return QPixmap.fromImage(ImageQt(reader.convert("RGBA")))
+        except Exception:
+            return QPixmap()
+        finally:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+
+    def render_viewer_preview_pixmap(self, path, *, fast_video=False):
+        path = Path(path)
+        if is_video(path):
+            return self.video_preview_pixmap(path, allow_shell=not fast_video)
+        if self.is_animated_image_path(path):
+            pix = self.first_animated_frame_pixmap(path)
+            if pix.isNull():
+                pix = QPixmap(str(path))
+        else:
+            pix = QPixmap(str(path))
+        if pix.isNull():
+            return pix
+        if self.rotation:
+            from PySide6.QtGui import QTransform
+            pix = pix.transformed(QTransform().rotate(self.rotation), Qt.SmoothTransformation)
+        target = self.target_size(None, pix)
+        return pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def cached_viewer_preview_pixmap(self, path):
+        key = self.viewer_pixmap_cache_key(path)
+        cached = self.viewer_pixmap_cache.get(key)
+        if cached is not None:
+            return cached
+        pix = self.render_viewer_preview_pixmap(path)
+        if pix.isNull():
+            return pix
+        self.viewer_pixmap_cache[key] = pix
+        self.viewer_pixmap_cache_order.append(key)
+        while len(self.viewer_pixmap_cache_order) > 64:
+            old_key = self.viewer_pixmap_cache_order.pop(0)
+            self.viewer_pixmap_cache.pop(old_key, None)
+        return pix
+
+    def build_prepared_viewer_items(self, group, active_video_slots):
+        prepared = []
+        for col, path in enumerate(group):
+            if col in active_video_slots:
+                pix = QPixmap()
+            elif is_video(path):
+                pix = self.render_viewer_preview_pixmap(path, fast_video=True)
+            elif is_image(path):
+                pix = self.cached_viewer_preview_pixmap(path)
+            else:
+                pix = QPixmap()
+            prepared.append({
+                "col": col,
+                "path": path,
+                "pix": pix,
+                "active_video": col in active_video_slots,
+                "video": is_video(path),
+                "animated": is_image(path) and self.is_animated_image_path(path),
+            })
+        return prepared
+
+    def queue_viewer_preloads(self):
+        if self.viewer_mode in ("webtoon", "webtoon_vertical") or not self.items:
+            return
+        offsets = []
+        for distance in range(1, 6):
+            offsets.extend([distance, -distance])
+        queue = []
+        for offset in offsets:
+            idx = self.index + offset
+            if 0 <= idx < len(self.items):
+                path = self.items[idx]
+                if is_image(path):
+                    key = self.viewer_pixmap_cache_key(path)
+                    if key not in self.viewer_pixmap_cache:
+                        queue.append(path)
+        self.viewer_preload_queue = queue
+        self.viewer_preload_queued = {str(path) for path in queue}
+        if queue and not self.viewer_preload_timer.isActive():
+            self.viewer_preload_timer.start()
+
+    def process_next_viewer_preload(self):
+        if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+            self.viewer_preload_timer.stop()
+            return
+        while self.viewer_preload_queue:
+            path = self.viewer_preload_queue.pop(0)
+            self.viewer_preload_queued.discard(str(path))
+            if Path(path).exists() and is_image(path):
+                self.cached_viewer_preview_pixmap(path)
+                return
+        self.viewer_preload_timer.stop()
+
     def show_current(self, reset=False):
+        self.render_generation += 1
+        generation = self.render_generation
         if reset:
             self.fit_mode = self.settings.get("default_fit", "fit_height")
             self.fit_combo.setCurrentText(self.fit_mode)
             self.zoom_factor = 1.0
             self.update_manual_zoom_controls()
-        self.clear_grid()
         group = self.current_group()
+        active_video_slots = self.active_video_slots_for_group(group)
+        prepared_items = None
+        if group and self.viewer_mode not in ("webtoon", "webtoon_vertical"):
+            prepared_items = self.build_prepared_viewer_items(group, active_video_slots)
+
+        self.clear_grid()
         self.active_display_path = self.focus_path_for_group(group)
         if not group:
             label = QLabel("No media")
             label.setAlignment(Qt.AlignCenter)
+            label.setAttribute(Qt.WA_StyledBackground, True)
+            label.setStyleSheet("background: #050505; color: #f0f0f0;")
             self.grid.addWidget(label, 0, 0)
             return
 
-        active_video_slots = self.active_video_slots_for_group(group)
         self.current_is_video = bool(active_video_slots)
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             reference = self.items[self.index] if self.items and is_image(self.items[self.index]) else (group[0] if group else None)
             self.reset_webtoon_target_width(reference)
             container = QWidget()
+            container.setAttribute(Qt.WA_StyledBackground, True)
+            container.setAutoFillBackground(True)
+            container_palette = container.palette()
+            container_palette.setColor(QPalette.Window, QColor("#050505"))
+            container.setPalette(container_palette)
+            container.setStyleSheet("background: #050505;")
             layout = QVBoxLayout(container)
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setSpacing(0)
@@ -1079,6 +1245,8 @@ class ViewerWindow(QMainWindow):
                 if is_image(path):
                     label = QLabel()
                     label.setAlignment(Qt.AlignCenter)
+                    label.setAttribute(Qt.WA_StyledBackground, True)
+                    label.setAutoFillBackground(True)
                     label.setMinimumHeight(120)
                     label.setStyleSheet("background: #050505; color: #777;")
                     label.setText(path.name)
@@ -1086,31 +1254,51 @@ class ViewerWindow(QMainWindow):
                     self.labels.append((label, path))
             layout.addStretch(1)
             scroll = QScrollArea()
+            scroll.setAttribute(Qt.WA_StyledBackground, True)
             scroll.setWidgetResizable(True)
             scroll.setWidget(container)
+            scroll.setAutoFillBackground(True)
             scroll.setStyleSheet("background: #050505;")
+            scroll.viewport().setAutoFillBackground(True)
+            scroll.viewport().setAttribute(Qt.WA_StyledBackground, True)
+            scroll.viewport().setStyleSheet("background: #050505;")
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
             scroll.verticalScrollBar().valueChanged.connect(self.schedule_webtoon_visible_update)
             self.webtoon_scroll = scroll
             self.grid.addWidget(scroll, 0, 0)
-            self.schedule_webtoon_visible_update()
+            self.schedule_webtoon_visible_update(generation)
             self.webtoon_idle_timer.start()
         else:
-            for col, path in enumerate(group):
-                if col in active_video_slots:
+            for item in prepared_items or []:
+                col = item["col"]
+                path = item["path"]
+                if item["active_video"]:
                     frame = self.video_frame if not self.media_player or self.video_path is None else self.create_video_frame()
                     self.grid.addWidget(frame, 0, col)
                     self.play_video(path, frame=frame, primary=(self.video_path is None))
-                elif is_video(path):
-                    self.grid.addWidget(self.make_video_preview_label(path), 0, col)
+                elif item["video"]:
+                    label = QLabel()
+                    label.setAlignment(Qt.AlignCenter)
+                    label.setAttribute(Qt.WA_StyledBackground, True)
+                    label.setAutoFillBackground(True)
+                    label.setStyleSheet("background: #050505;")
+                    label.setPixmap(item["pix"])
+                    label.setToolTip(Path(path).name)
+                    self.grid.addWidget(label, 0, col)
+                    QTimer.singleShot(80, lambda lbl=label, p=Path(path), g=generation: self.update_video_preview_label(lbl, p, g))
                 else:
                     label = QLabel()
                     label.setAlignment(Qt.AlignCenter)
+                    label.setAttribute(Qt.WA_StyledBackground, True)
+                    label.setAutoFillBackground(True)
                     label.setStyleSheet("background: #050505;")
+                    if not item["pix"].isNull():
+                        label.setPixmap(item["pix"])
                     self.grid.addWidget(label, 0, col)
                     self.labels.append((label, path))
-            self.schedule_image_update()
+            QTimer.singleShot(0, lambda g=generation: self.start_visible_animations(g))
+            self.queue_viewer_preloads()
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             title_name = "webtoon"
         else:
@@ -1158,17 +1346,19 @@ class ViewerWindow(QMainWindow):
             label.setText(name)
             label.setToolTip(name)
 
-    def schedule_image_update(self):
+    def schedule_image_update(self, generation=None):
+        generation = self.render_generation if generation is None else generation
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             self.reset_webtoon_target_width()
-            self.schedule_webtoon_visible_update()
+            self.schedule_webtoon_visible_update(generation)
             return
-        QTimer.singleShot(0, self.update_image_labels)
-        QTimer.singleShot(40, self.update_image_labels)
+        QTimer.singleShot(0, lambda g=generation: self.update_image_labels(g))
+        QTimer.singleShot(40, lambda g=generation: self.update_image_labels(g))
 
-    def schedule_webtoon_visible_update(self):
-        QTimer.singleShot(0, self.update_webtoon_visible_images)
-        QTimer.singleShot(60, self.update_webtoon_visible_images)
+    def schedule_webtoon_visible_update(self, generation=None):
+        generation = self.render_generation if generation is None else generation
+        QTimer.singleShot(0, lambda g=generation: self.update_webtoon_visible_images(g))
+        QTimer.singleShot(60, lambda g=generation: self.update_webtoon_visible_images(g))
 
     def image_pixel_size(self, path):
         reader = QImageReader(str(path))
@@ -1244,7 +1434,10 @@ class ViewerWindow(QMainWindow):
 
     def create_video_frame(self):
         frame = QFrame()
+        frame.setObjectName("videoFrame")
+        frame.setAttribute(Qt.WA_StyledBackground, True)
         frame.setStyleSheet("background: #000;")
+        frame.setAutoFillBackground(True)
         frame.setFocusPolicy(Qt.StrongFocus)
         frame.setMouseTracking(True)
         frame.installEventFilter(self)
@@ -1254,6 +1447,8 @@ class ViewerWindow(QMainWindow):
         if not self.vlc_instance:
             label = QLabel("VLC runtime not available\n" + path.name)
             label.setAlignment(Qt.AlignCenter)
+            label.setAttribute(Qt.WA_StyledBackground, True)
+            label.setStyleSheet("background: #050505; color: #f0f0f0;")
             self.grid.addWidget(label, 0, 0)
             return
         frame = frame or self.video_frame
@@ -1266,6 +1461,10 @@ class ViewerWindow(QMainWindow):
             self.video_stopped_by_user = False
         else:
             self.extra_media_players.append(player)
+        frame.setVisible(True)
+        frame.show()
+        frame.raise_()
+        frame.repaint()
         media = self.vlc_instance.media_new(str(path))
         player.set_media(media)
         player.set_hwnd(int(frame.winId()))
@@ -1283,12 +1482,21 @@ class ViewerWindow(QMainWindow):
     def make_video_preview_label(self, path):
         label = QLabel()
         label.setAlignment(Qt.AlignCenter)
+        label.setAttribute(Qt.WA_StyledBackground, True)
+        label.setAutoFillBackground(True)
         label.setStyleSheet("background: #050505;")
         label.setPixmap(self.video_preview_pixmap(Path(path)))
         label.setToolTip(Path(path).name)
         return label
 
-    def video_preview_pixmap(self, path):
+    def update_video_preview_label(self, label, path, generation=None):
+        if generation is not None and generation != self.render_generation:
+            return
+        if label is None or label.parent() is None:
+            return
+        label.setPixmap(self.video_preview_pixmap(Path(path), allow_shell=True))
+
+    def video_preview_pixmap(self, path, allow_shell=True):
         size = self.viewer_area()
         width = max(220, size.width())
         height = max(220, size.height())
@@ -1301,10 +1509,10 @@ class ViewerWindow(QMainWindow):
         painter.drawRect(0, 0, width - 1, height - 1)
 
         thumb = self.video_thumbnail_cache.get(str(path))
-        if thumb is None:
-            thumb = windows_shell_thumbnail(path, max(256, min(768, max(width, height))))
+        if thumb is None and allow_shell:
+            thumb = windows_shell_thumbnail(path, max(256, min(512, max(width, height))))
             self.video_thumbnail_cache[str(path)] = thumb if thumb is not None else False
-        if thumb is False:
+        if thumb is False or thumb is None:
             thumb = None
         if thumb is not None and not thumb.isNull():
             scaled = thumb.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -1469,13 +1677,24 @@ class ViewerWindow(QMainWindow):
         if not self.animated_image_states:
             self.animated_image_timer.stop()
 
-    def update_image_labels(self):
+    def update_image_labels(self, generation=None):
+        if generation is not None and generation != self.render_generation:
+            return
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             self.webtoon_loaded = set()
-            self.update_webtoon_visible_images()
+            self.update_webtoon_visible_images(generation)
             return
         for label, path in self.labels:
             self.load_image_label(label, path)
+
+    def start_visible_animations(self, generation=None):
+        if generation is not None and generation != self.render_generation:
+            return
+        if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+            return
+        for label, path in self.labels:
+            if self.is_animated_image_path(path):
+                self.try_start_animated_image(label, path)
 
     def load_image_label(self, label, path):
         if self.try_start_animated_image(label, path):
@@ -1519,7 +1738,9 @@ class ViewerWindow(QMainWindow):
         end = min(len(self.labels) - 1, anchor + margin)
         return list(range(start, end + 1))
 
-    def update_webtoon_visible_images(self):
+    def update_webtoon_visible_images(self, generation=None):
+        if generation is not None and generation != self.render_generation:
+            return
         for idx in self.visible_webtoon_indices(margin=2):
             if idx in self.webtoon_loaded:
                 continue
@@ -1531,7 +1752,7 @@ class ViewerWindow(QMainWindow):
         if self.viewer_mode not in ("webtoon", "webtoon_vertical") or not self.labels:
             self.webtoon_idle_timer.stop()
             return
-        self.update_webtoon_visible_images()
+        self.update_webtoon_visible_images(self.render_generation)
         visible = set(self.visible_webtoon_indices(margin=2))
         for _ in range(len(self.labels)):
             idx = self.webtoon_idle_index % len(self.labels)
