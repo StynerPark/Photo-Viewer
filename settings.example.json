@@ -8,6 +8,8 @@
   "zoom_locked": true,
   "theme": "dark",
   "instance_mode": "multi",
+  "webtoon_auto_scroll_speed_mode": "normal",
+  "webtoon_auto_scroll_manual_speed": 120,
   "quick_paths": [],
   "geometry": {},
   "shortcuts": {

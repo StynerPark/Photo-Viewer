@@ -33,8 +33,8 @@ if not DEFAULT_START_FOLDER.exists():
 
 from PIL import Image
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QAbstractNativeEventFilter, QDir, QEvent, QFileInfo, QFileSystemWatcher, QMimeData, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QKeySequence, QMovie, QPainter, QPalette, QPixmap, QShortcut
+from PySide6.QtCore import QAbstractNativeEventFilter, QDir, QEvent, QFileInfo, QFileSystemWatcher, QMimeData, QPoint, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QIntValidator, QKeySequence, QMovie, QPainter, QPalette, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -95,6 +95,13 @@ MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 ARCHIVE_EXTS = {".zip"}
 WEBTOON_MIN_WIDTH = 320
 WEBTOON_MAX_WIDTH = 3840
+WEBTOON_AUTO_SCROLL_SPEEDS = {
+    "slow": 60,
+    "normal": 120,
+    "fast": 240,
+}
+WEBTOON_AUTO_SCROLL_MIN_SPEED = 10
+WEBTOON_AUTO_SCROLL_MAX_SPEED = 1000
 
 
 DEFAULT_SETTINGS = {
@@ -107,6 +114,8 @@ DEFAULT_SETTINGS = {
     "zoom_locked": True,
     "theme": "dark",
     "instance_mode": "multi",
+    "webtoon_auto_scroll_speed_mode": "normal",
+    "webtoon_auto_scroll_manual_speed": 120,
     "quick_paths": [],
     "geometry": {},
     "shortcuts": {
@@ -573,6 +582,101 @@ class PreviewPanel(QLabel):
         super().resizeEvent(event)
 
 
+class PannableImageLabel(QLabel):
+    def __init__(self):
+        super().__init__()
+        self._viewer_pixmap = QPixmap()
+        self._pan_offset = QPoint(0, 0)
+        self._dragging = False
+        self._drag_start_pos = QPoint(0, 0)
+        self._drag_start_offset = QPoint(0, 0)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
+
+    def setText(self, text):
+        if text:
+            self._viewer_pixmap = QPixmap()
+            self._pan_offset = QPoint(0, 0)
+            self.unsetCursor()
+        super().setText(text)
+
+    def setPixmap(self, pixmap):
+        self._viewer_pixmap = QPixmap(pixmap) if pixmap is not None and not pixmap.isNull() else QPixmap()
+        super().setPixmap(QPixmap())
+        self._pan_offset = self.clamped_pan_offset(self._pan_offset)
+        self.update_pan_cursor()
+        self.update()
+
+    def can_pan(self):
+        if self._viewer_pixmap.isNull():
+            return False
+        return self._viewer_pixmap.width() > self.width() or self._viewer_pixmap.height() > self.height()
+
+    def clamped_pan_offset(self, offset):
+        if self._viewer_pixmap.isNull():
+            return QPoint(0, 0)
+        max_x = max(0, (self._viewer_pixmap.width() - self.width()) // 2)
+        max_y = max(0, (self._viewer_pixmap.height() - self.height()) // 2)
+        return QPoint(
+            max(-max_x, min(max_x, offset.x())),
+            max(-max_y, min(max_y, offset.y())),
+        )
+
+    def update_pan_cursor(self):
+        if self._dragging:
+            self.setCursor(Qt.ClosedHandCursor)
+        elif self.can_pan():
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.unsetCursor()
+
+    def paintEvent(self, event):
+        if self._viewer_pixmap.isNull():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        offset = self.clamped_pan_offset(self._pan_offset)
+        if offset != self._pan_offset:
+            self._pan_offset = offset
+        x = (self.width() - self._viewer_pixmap.width()) // 2 + self._pan_offset.x()
+        y = (self.height() - self._viewer_pixmap.height()) // 2 + self._pan_offset.y()
+        painter.drawPixmap(x, y, self._viewer_pixmap)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.can_pan():
+            self._dragging = True
+            self._drag_start_pos = event.position().toPoint()
+            self._drag_start_offset = QPoint(self._pan_offset)
+            self.update_pan_cursor()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            delta = event.position().toPoint() - self._drag_start_pos
+            self._pan_offset = self.clamped_pan_offset(self._drag_start_offset + delta)
+            self.update()
+            event.accept()
+            return
+        self.update_pan_cursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self.update_pan_cursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._pan_offset = self.clamped_pan_offset(self._pan_offset)
+        self.update_pan_cursor()
+
+
 class ViewerNativeInputFilter(QAbstractNativeEventFilter):
     WM_KEYDOWN = 0x0100
     WM_SYSKEYDOWN = 0x0104
@@ -738,6 +842,17 @@ class ViewerWindow(QMainWindow):
         self.webtoon_target_width = None
         self.webtoon_pixmap_cache = {}
         self.webtoon_pixmap_cache_order = []
+        self.webtoon_auto_scroll_active = False
+        self.webtoon_auto_scroll_remainder = 0.0
+        self.webtoon_auto_scroll_last_tick = 0.0
+        self.webtoon_auto_scroll_speed_mode = settings.get("webtoon_auto_scroll_speed_mode", "normal")
+        if self.webtoon_auto_scroll_speed_mode not in (*WEBTOON_AUTO_SCROLL_SPEEDS.keys(), "manual"):
+            self.webtoon_auto_scroll_speed_mode = "normal"
+        self.webtoon_auto_scroll_manual_speed = int(settings.get("webtoon_auto_scroll_manual_speed", 120) or 120)
+        self.webtoon_auto_scroll_manual_speed = max(
+            WEBTOON_AUTO_SCROLL_MIN_SPEED,
+            min(WEBTOON_AUTO_SCROLL_MAX_SPEED, self.webtoon_auto_scroll_manual_speed),
+        )
         self.viewer_pixmap_cache = {}
         self.viewer_pixmap_cache_order = []
         self.viewer_preload_queue = []
@@ -912,6 +1027,49 @@ class ViewerWindow(QMainWindow):
         video_layout.addWidget(QLabel("Vol"))
         video_layout.addWidget(self.volume_slider)
         self.video_overlay.hide()
+
+        self.webtoon_auto_scroll_overlay = QFrame(self.central)
+        self.webtoon_auto_scroll_overlay.setObjectName("webtoonAutoScrollOverlay")
+        self.webtoon_auto_scroll_overlay.setStyleSheet("""
+            #webtoonAutoScrollOverlay { background: rgba(12,14,18,225); border: 1px solid rgba(255,255,255,70); border-radius: 6px; color: white; }
+            QPushButton, QLineEdit { background: #343842; color: #f2f2f2; border: 1px solid #5b6270; padding: 5px 8px; }
+            QPushButton:checked { background: #2f7dd3; border-color: #85bcff; color: white; font-weight: 700; }
+            QLineEdit { min-width: 54px; }
+        """)
+        auto_scroll_layout = QVBoxLayout(self.webtoon_auto_scroll_overlay)
+        auto_scroll_layout.setContentsMargins(8, 8, 8, 8)
+        auto_scroll_layout.setSpacing(6)
+        self.webtoon_auto_scroll_toggle_btn = QPushButton("ON")
+        self.webtoon_auto_scroll_toggle_btn.setCheckable(True)
+        self.webtoon_auto_scroll_toggle_btn.setToolTip("Ctrl+Space")
+        self.webtoon_auto_scroll_toggle_btn.clicked.connect(self.toggle_webtoon_auto_scroll)
+        auto_scroll_layout.addWidget(self.webtoon_auto_scroll_toggle_btn)
+        self.webtoon_auto_scroll_speed_buttons = {}
+        for mode, label in [
+            ("slow", f"느림 ({WEBTOON_AUTO_SCROLL_SPEEDS['slow']})"),
+            ("normal", f"보통 ({WEBTOON_AUTO_SCROLL_SPEEDS['normal']})"),
+            ("fast", f"빠름 ({WEBTOON_AUTO_SCROLL_SPEEDS['fast']})"),
+        ]:
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, value=mode: self.set_webtoon_auto_scroll_speed_mode(value))
+            auto_scroll_layout.addWidget(button)
+            self.webtoon_auto_scroll_speed_buttons[mode] = button
+        manual_row = QHBoxLayout()
+        manual_row.setContentsMargins(0, 0, 0, 0)
+        manual_row.setSpacing(4)
+        self.webtoon_auto_scroll_manual_btn = QPushButton("매뉴얼")
+        self.webtoon_auto_scroll_manual_btn.setCheckable(True)
+        self.webtoon_auto_scroll_manual_btn.clicked.connect(lambda: self.set_webtoon_auto_scroll_speed_mode("manual"))
+        self.webtoon_auto_scroll_manual_edit = QLineEdit(str(self.webtoon_auto_scroll_manual_speed))
+        self.webtoon_auto_scroll_manual_edit.setAlignment(Qt.AlignCenter)
+        self.webtoon_auto_scroll_manual_edit.setValidator(QIntValidator(WEBTOON_AUTO_SCROLL_MIN_SPEED, WEBTOON_AUTO_SCROLL_MAX_SPEED, self))
+        self.webtoon_auto_scroll_manual_edit.editingFinished.connect(self.apply_webtoon_auto_scroll_manual_speed)
+        manual_row.addWidget(self.webtoon_auto_scroll_manual_btn)
+        manual_row.addWidget(self.webtoon_auto_scroll_manual_edit)
+        auto_scroll_layout.addLayout(manual_row)
+        self.webtoon_auto_scroll_overlay.hide()
+
         self.video_timer = QTimer(self)
         self.video_timer.timeout.connect(self.update_video_controls)
         self.animated_image_timer = QTimer(self)
@@ -919,6 +1077,12 @@ class ViewerWindow(QMainWindow):
         self.webtoon_idle_timer = QTimer(self)
         self.webtoon_idle_timer.setInterval(120)
         self.webtoon_idle_timer.timeout.connect(self.load_next_webtoon_idle_image)
+        self.webtoon_auto_scroll_timer = QTimer(self)
+        self.webtoon_auto_scroll_timer.setInterval(16)
+        self.webtoon_auto_scroll_timer.timeout.connect(self.advance_webtoon_auto_scroll)
+        self.webtoon_auto_scroll_hide_timer = QTimer(self)
+        self.webtoon_auto_scroll_hide_timer.setSingleShot(True)
+        self.webtoon_auto_scroll_hide_timer.timeout.connect(self.hide_webtoon_auto_scroll_overlay)
         self.viewer_preload_timer = QTimer(self)
         self.viewer_preload_timer.setInterval(55)
         self.viewer_preload_timer.timeout.connect(self.process_next_viewer_preload)
@@ -929,6 +1093,7 @@ class ViewerWindow(QMainWindow):
         self.input_layer.setStyleSheet("background: transparent;")
         self.input_layer.installEventFilter(self)
         self.input_layer.raise_()
+        self.update_webtoon_auto_scroll_controls()
 
     def build_mode_menu(self):
         menu = QMenu(self.mode_btn)
@@ -985,6 +1150,108 @@ class ViewerWindow(QMainWindow):
         self.update_manual_zoom_controls()
         self.schedule_image_update()
 
+    def is_webtoon_viewer_mode(self):
+        return self.viewer_mode in ("webtoon", "webtoon_vertical")
+
+    def webtoon_auto_scroll_speed(self):
+        if self.webtoon_auto_scroll_speed_mode == "manual":
+            return max(
+                WEBTOON_AUTO_SCROLL_MIN_SPEED,
+                min(WEBTOON_AUTO_SCROLL_MAX_SPEED, int(self.webtoon_auto_scroll_manual_speed)),
+            )
+        return WEBTOON_AUTO_SCROLL_SPEEDS.get(self.webtoon_auto_scroll_speed_mode, WEBTOON_AUTO_SCROLL_SPEEDS["normal"])
+
+    def set_webtoon_auto_scroll_speed_mode(self, mode):
+        if mode not in (*WEBTOON_AUTO_SCROLL_SPEEDS.keys(), "manual"):
+            mode = "normal"
+        self.webtoon_auto_scroll_speed_mode = mode
+        self.settings["webtoon_auto_scroll_speed_mode"] = mode
+        save_settings(self.settings)
+        self.update_webtoon_auto_scroll_controls()
+
+    def apply_webtoon_auto_scroll_manual_speed(self):
+        text = self.webtoon_auto_scroll_manual_edit.text().strip()
+        try:
+            speed = int(text)
+        except ValueError:
+            speed = self.webtoon_auto_scroll_manual_speed
+        speed = max(WEBTOON_AUTO_SCROLL_MIN_SPEED, min(WEBTOON_AUTO_SCROLL_MAX_SPEED, speed))
+        self.webtoon_auto_scroll_manual_speed = speed
+        self.webtoon_auto_scroll_manual_edit.setText(str(speed))
+        self.settings["webtoon_auto_scroll_manual_speed"] = speed
+        save_settings(self.settings)
+        self.set_webtoon_auto_scroll_speed_mode("manual")
+
+    def update_webtoon_auto_scroll_controls(self):
+        if not hasattr(self, "webtoon_auto_scroll_toggle_btn"):
+            return
+        self.webtoon_auto_scroll_toggle_btn.setText("OFF" if self.webtoon_auto_scroll_active else "ON")
+        self.webtoon_auto_scroll_toggle_btn.setChecked(self.webtoon_auto_scroll_active)
+        for mode, button in self.webtoon_auto_scroll_speed_buttons.items():
+            button.setChecked(self.webtoon_auto_scroll_speed_mode == mode)
+        self.webtoon_auto_scroll_manual_btn.setChecked(self.webtoon_auto_scroll_speed_mode == "manual")
+        if not self.webtoon_auto_scroll_manual_edit.hasFocus():
+            self.webtoon_auto_scroll_manual_edit.setText(str(self.webtoon_auto_scroll_manual_speed))
+
+    def toggle_webtoon_auto_scroll(self):
+        if not self.is_webtoon_viewer_mode() or not self.webtoon_scroll:
+            return
+        if self.webtoon_auto_scroll_active:
+            self.stop_webtoon_auto_scroll()
+        else:
+            self.start_webtoon_auto_scroll()
+        self.show_webtoon_auto_scroll_overlay()
+
+    def start_webtoon_auto_scroll(self):
+        if not self.is_webtoon_viewer_mode() or not self.webtoon_scroll:
+            return
+        self.webtoon_auto_scroll_active = True
+        self.webtoon_auto_scroll_remainder = 0.0
+        self.webtoon_auto_scroll_last_tick = time.monotonic()
+        self.webtoon_auto_scroll_timer.start()
+        self.update_webtoon_auto_scroll_controls()
+
+    def stop_webtoon_auto_scroll(self):
+        self.webtoon_auto_scroll_active = False
+        self.webtoon_auto_scroll_remainder = 0.0
+        if hasattr(self, "webtoon_auto_scroll_timer"):
+            self.webtoon_auto_scroll_timer.stop()
+        self.update_webtoon_auto_scroll_controls()
+
+    def advance_webtoon_auto_scroll(self):
+        if not self.webtoon_auto_scroll_active or not self.is_webtoon_viewer_mode() or not self.webtoon_scroll:
+            self.stop_webtoon_auto_scroll()
+            return
+        now = time.monotonic()
+        elapsed = max(0.0, min(0.25, now - self.webtoon_auto_scroll_last_tick))
+        self.webtoon_auto_scroll_last_tick = now
+        self.webtoon_auto_scroll_remainder += self.webtoon_auto_scroll_speed() * elapsed
+        pixels = int(self.webtoon_auto_scroll_remainder)
+        if pixels <= 0:
+            return
+        self.webtoon_auto_scroll_remainder -= pixels
+        bar = self.webtoon_scroll.verticalScrollBar()
+        old_value = bar.value()
+        bar.setValue(min(bar.maximum(), old_value + pixels))
+        if bar.value() >= bar.maximum() and bar.value() == old_value:
+            self.stop_webtoon_auto_scroll()
+
+    def show_webtoon_auto_scroll_overlay(self):
+        if not self.is_webtoon_viewer_mode():
+            self.webtoon_auto_scroll_overlay.hide()
+            return
+        self.update_webtoon_auto_scroll_controls()
+        self.position_overlays()
+        self.webtoon_auto_scroll_overlay.show()
+        self.webtoon_auto_scroll_overlay.raise_()
+        self.webtoon_auto_scroll_hide_timer.start(5000)
+
+    def hide_webtoon_auto_scroll_overlay(self):
+        if self.webtoon_auto_scroll_manual_edit.hasFocus():
+            self.webtoon_auto_scroll_hide_timer.start(5000)
+            return
+        self.webtoon_auto_scroll_overlay.hide()
+
     def _build_shortcuts(self):
         mapping = {
             "next_media": self.next_media,
@@ -1019,6 +1286,9 @@ class ViewerWindow(QMainWindow):
             shortcut = QShortcut(QKeySequence(seq), self)
             shortcut.setContext(Qt.ApplicationShortcut)
             shortcut.activated.connect(callback)
+        self.webtoon_auto_scroll_shortcut = QShortcut(QKeySequence("Ctrl+Space"), self)
+        self.webtoon_auto_scroll_shortcut.setContext(Qt.ApplicationShortcut)
+        self.webtoon_auto_scroll_shortcut.activated.connect(self.toggle_webtoon_auto_scroll)
 
     def _init_vlc(self):
         if vlc is None:
@@ -1064,6 +1334,7 @@ class ViewerWindow(QMainWindow):
 
     def clear_grid(self):
         self.stop_media()
+        self.stop_webtoon_auto_scroll()
         self.webtoon_scroll = None
         self.webtoon_loaded = set()
         self.webtoon_idle_index = 0
@@ -1288,8 +1559,7 @@ class ViewerWindow(QMainWindow):
                     self.grid.addWidget(label, 0, col)
                     QTimer.singleShot(80, lambda lbl=label, p=Path(path), g=generation: self.update_video_preview_label(lbl, p, g))
                 else:
-                    label = QLabel()
-                    label.setAlignment(Qt.AlignCenter)
+                    label = PannableImageLabel()
                     label.setAttribute(Qt.WA_StyledBackground, True)
                     label.setAutoFillBackground(True)
                     label.setStyleSheet("background: #050505;")
@@ -1741,7 +2011,8 @@ class ViewerWindow(QMainWindow):
     def update_webtoon_visible_images(self, generation=None):
         if generation is not None and generation != self.render_generation:
             return
-        for idx in self.visible_webtoon_indices(margin=2):
+        margin = 4 if self.webtoon_auto_scroll_active else 2
+        for idx in self.visible_webtoon_indices(margin=margin):
             if idx in self.webtoon_loaded:
                 continue
             label, path = self.labels[idx]
@@ -1753,7 +2024,8 @@ class ViewerWindow(QMainWindow):
             self.webtoon_idle_timer.stop()
             return
         self.update_webtoon_visible_images(self.render_generation)
-        visible = set(self.visible_webtoon_indices(margin=2))
+        visible_margin = 4 if self.webtoon_auto_scroll_active else 2
+        visible = set(self.visible_webtoon_indices(margin=visible_margin))
         for _ in range(len(self.labels)):
             idx = self.webtoon_idle_index % len(self.labels)
             self.webtoon_idle_index += 1
@@ -1847,6 +2119,17 @@ class ViewerWindow(QMainWindow):
             video_w,
             video_h,
         )
+        self.webtoon_auto_scroll_overlay.adjustSize()
+        webtoon_w = min(self.webtoon_auto_scroll_overlay.sizeHint().width(), max(130, self.central.width() - margin * 2))
+        webtoon_h = self.webtoon_auto_scroll_overlay.sizeHint().height()
+        self.webtoon_auto_scroll_overlay.setGeometry(
+            max(margin, self.central.width() - webtoon_w - margin),
+            max(margin, (self.central.height() - webtoon_h) // 2),
+            webtoon_w,
+            webtoon_h,
+        )
+        if not self.is_webtoon_viewer_mode():
+            self.webtoon_auto_scroll_overlay.hide()
         self.corner_filename_label.adjustSize()
         self.corner_filename_label.setGeometry(margin, margin, self.corner_filename_label.sizeHint().width(), self.corner_filename_label.sizeHint().height())
         self.corner_filename_label.setVisible(bool(self.current_file_name()) and not self.window().isFullScreen())
@@ -1860,6 +2143,7 @@ class ViewerWindow(QMainWindow):
         self.viewer_overlay.raise_()
         self.rotation_overlay.raise_()
         self.video_overlay.raise_()
+        self.webtoon_auto_scroll_overlay.raise_()
         self.corner_filename_label.raise_()
 
     def show_overlays(self, pos=None):
@@ -1883,6 +2167,8 @@ class ViewerWindow(QMainWindow):
                 self.rotation_overlay.show()
         if self.viewer_overlay.isVisible() or self.video_overlay.isVisible() or self.rotation_overlay.isVisible():
             self.overlay_timer.start(1800)
+        if self.is_webtoon_viewer_mode():
+            self.show_webtoon_auto_scroll_overlay()
 
     def hide_overlays(self):
         self.viewer_overlay.hide()
@@ -1931,6 +2217,8 @@ class ViewerWindow(QMainWindow):
             self.first_media()
         elif event.key() == Qt.Key_End:
             self.last_media()
+        elif event.key() == Qt.Key_Space and event.modifiers() & Qt.ControlModifier and self.is_webtoon_viewer_mode():
+            self.toggle_webtoon_auto_scroll()
         elif event.key() == Qt.Key_Space:
             self.handle_space()
         elif event.key() == Qt.Key_Delete:
@@ -1963,6 +2251,9 @@ class ViewerWindow(QMainWindow):
                 return True
             if event.key() == Qt.Key_End:
                 self.last_media()
+                return True
+            if event.key() == Qt.Key_Space and event.modifiers() & Qt.ControlModifier and self.is_webtoon_viewer_mode():
+                self.toggle_webtoon_auto_scroll()
                 return True
             if event.key() == Qt.Key_Space:
                 self.handle_space()
@@ -2093,6 +2384,8 @@ class ViewerWindow(QMainWindow):
     def scroll_webtoon(self, delta):
         if self.viewer_mode not in ("webtoon", "webtoon_vertical") or not self.webtoon_scroll:
             return False
+        if self.webtoon_auto_scroll_active:
+            self.stop_webtoon_auto_scroll()
         bar = self.webtoon_scroll.verticalScrollBar()
         step = max(24, int(abs(delta) * 0.45))
         bar.setValue(bar.value() - step if delta > 0 else bar.value() + step)
@@ -2107,7 +2400,7 @@ class ViewerWindow(QMainWindow):
         return True
 
     def point_on_overlay(self, pos):
-        overlays = [self.viewer_overlay, self.rotation_overlay, self.video_overlay]
+        overlays = [self.viewer_overlay, self.rotation_overlay, self.video_overlay, self.webtoon_auto_scroll_overlay]
         return any(widget.isVisible() and widget.geometry().contains(pos) for widget in overlays)
 
     def force_manual_for_zoom(self):
@@ -2285,6 +2578,7 @@ class ViewerWindow(QMainWindow):
             top.showFullScreen()
 
     def closeEvent(self, event):
+        self.stop_webtoon_auto_scroll()
         self.stop_media()
         if self._app_filter_installed:
             QApplication.instance().removeEventFilter(self)
@@ -2388,6 +2682,13 @@ class MainWindow(QMainWindow):
         self.thumbnail_timer = QTimer(self)
         self.thumbnail_timer.setInterval(35)
         self.thumbnail_timer.timeout.connect(self.process_next_thumbnail)
+        self.startup_media_scan_timer = QTimer(self)
+        self.startup_media_scan_timer.setInterval(1)
+        self.startup_media_scan_timer.timeout.connect(self.process_startup_media_scan)
+        self.startup_media_scan_iter = None
+        self.startup_media_scan_paths = []
+        self.startup_media_scan_seen = set()
+        self.startup_media_scan_target = None
         self.icon_provider = QFileIconProvider()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
@@ -2914,11 +3215,87 @@ class MainWindow(QMainWindow):
         if model_index.isValid():
             self.tree.setCurrentIndex(model_index)
         self.watch_current_folder()
-        self.media_paths = self.collect_media_paths(self.current_folder)
         startup = str(self.startup_media_path)
-        if startup not in self.media_paths:
-            self.media_paths.insert(0, startup)
+        self.media_paths = [startup]
         self.update_current_tab()
+
+    def start_startup_media_scan(self):
+        if not self.startup_media_path:
+            return
+        if self.startup_media_scan_timer.isActive():
+            self.startup_media_scan_timer.stop()
+        try:
+            self.startup_media_scan_iter = iter(Path(self.current_folder).iterdir())
+        except (PermissionError, FileNotFoundError, OSError):
+            self.startup_media_scan_iter = None
+            return
+        self.startup_media_scan_paths = []
+        self.startup_media_scan_seen = set()
+        self.startup_media_scan_target = str(self.startup_media_path)
+        self.startup_media_scan_timer.start()
+
+    def process_startup_media_scan(self):
+        if self.startup_media_scan_iter is None:
+            self.startup_media_scan_timer.stop()
+            return
+        changed = False
+        finished = False
+        count = 0
+        started = time.monotonic()
+        while count < 160 and time.monotonic() - started < 0.008:
+            try:
+                child = next(self.startup_media_scan_iter)
+            except StopIteration:
+                finished = True
+                break
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+            count += 1
+            try:
+                if not child.is_file() or not is_media(child):
+                    continue
+            except OSError:
+                continue
+            path_text = str(child)
+            if path_text in self.startup_media_scan_seen:
+                continue
+            self.startup_media_scan_seen.add(path_text)
+            self.startup_media_scan_paths.append(path_text)
+            changed = True
+        if changed or finished:
+            self.apply_startup_media_scan_paths(final=finished)
+        if finished:
+            self.startup_media_scan_timer.stop()
+            self.startup_media_scan_iter = None
+
+    def apply_startup_media_scan_paths(self, final=False):
+        target = self.startup_media_scan_target or (str(self.startup_media_path) if self.startup_media_path else "")
+        if not target:
+            return
+        paths = list(self.startup_media_scan_paths)
+        if target not in paths:
+            paths.insert(0, target)
+        if paths == self.media_paths:
+            return
+        current = target
+        if self.viewer and self.viewer.items:
+            current = str(self.viewer.items[self.viewer.index])
+        self.media_paths = paths
+        if not self.viewer:
+            return
+        self.viewer.items = [Path(path) for path in self.media_paths if is_media(path)]
+        if not self.viewer.items:
+            return
+        if current in self.media_paths:
+            self.viewer.index = self.media_paths.index(current)
+        else:
+            self.viewer.index = min(self.viewer.index, len(self.viewer.items) - 1)
+        if final and self.viewer.viewer_mode in ("webtoon", "webtoon_vertical"):
+            self.viewer.show_current(reset=False)
+        else:
+            title_name = self.viewer.active_display_path.name if self.viewer.active_display_path else self.viewer.items[self.viewer.index].name
+            self.viewer.setWindowTitle(f"{APP_NAME} - {self.viewer.index + 1}/{len(self.viewer.items)} - {title_name}")
+            self.viewer.update_filename_labels()
 
     def remove_legacy_thumb_cache(self):
         old_cache = RUN_DIR / ".thumb_cache"
@@ -3329,7 +3706,8 @@ class MainWindow(QMainWindow):
 
     def open_startup_media(self):
         if self.startup_media_path and self.startup_media_path.exists():
-            self.open_viewer_for(self.startup_media_path)
+            if self.open_viewer_for(self.startup_media_path):
+                QTimer.singleShot(0, self.start_startup_media_scan)
 
     def activate_from_external_request(self):
         if self.isMinimized():
@@ -3345,11 +3723,11 @@ class MainWindow(QMainWindow):
         if not path_text:
             return
         path = Path(path_text)
+        direct_media_open = path.is_file() and is_media(path)
         if self.viewer:
-            self.exit_viewer_mode()
-        if path.is_file() and is_media(path):
-            if self.load_folder(path.parent):
-                self.open_viewer_for(path)
+            self.exit_viewer_mode(refresh=not direct_media_open)
+        if direct_media_open:
+            self.open_media_file_immediate(path)
         elif path.is_dir():
             self.load_folder(path)
         elif path.is_file() and is_archive(path):
@@ -3488,9 +3866,21 @@ class MainWindow(QMainWindow):
             else:
                 self.open_viewer_for(paths[0])
 
+    def open_media_file_immediate(self, path):
+        path = Path(path)
+        if not path.exists() or not path.is_file() or not is_media(path):
+            return False
+        self.current_folder = path.parent
+        self.startup_media_path = path
+        self.prepare_startup_media_folder()
+        if self.open_viewer_for(path):
+            QTimer.singleShot(0, self.start_startup_media_scan)
+            return True
+        return False
+
     def open_viewer_for(self, path):
         if not self.media_paths:
-            return
+            return False
         path = str(path)
         try:
             idx = self.media_paths.index(path)
@@ -3507,6 +3897,7 @@ class MainWindow(QMainWindow):
         self.main_stack.setCurrentWidget(self.viewer)
         self.showFullScreen()
         self.viewer.setFocus()
+        return True
 
     def copy_from_viewer(self, path):
         self.copy_paths([Path(path)])
@@ -3545,7 +3936,7 @@ class MainWindow(QMainWindow):
                 return
             self.viewer.setFocus()
 
-    def exit_viewer_mode(self):
+    def exit_viewer_mode(self, refresh=True):
         if not self.viewer:
             return
         current = None
@@ -3562,6 +3953,8 @@ class MainWindow(QMainWindow):
         self.nav_toolbar.hide()
         if self.isFullScreen():
             self.showNormal()
+        if not refresh:
+            return
         self.populate_list(lightweight=True)
         if current:
             self.select_path(current)

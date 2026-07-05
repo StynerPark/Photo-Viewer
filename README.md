@@ -62,9 +62,11 @@ Notes:
 - ZIP files open like folders for image viewing
 - Viewer mode opens from double-click or `Enter`
 - Full-screen photo viewing with mouse wheel/page navigation
+- Drag-to-pan viewing when zoomed images are larger than the viewer
 - Single, double, triple, and webtoon viewer modes
 - Japanese manga-style double page order: `2,1 / 4,3`
 - Webtoon mode with vertical continuous scrolling
+- Webtoon auto-scroll with slow, normal, fast, and manual speed controls
 - Webtoon loading optimized with visible-range priority, fixed target width, 4K
   width cap, scaled decoding, and memory cache
 - GIF, animated WebP, and APNG support
@@ -76,6 +78,10 @@ Notes:
 
 ## Recent Improvements
 
+- Improved double-click startup responsiveness by opening the selected media first
+  and expanding the surrounding folder media list immediately after the viewer is shown.
+- Kept mixed photo/video viewer stabilization intact while avoiding full folder
+  media collection before the first viewer frame.
 - Reduced white flashes and transient child-window artifacts during fast viewer navigation.
 - Improved MP4 startup responsiveness on low-end PCs by prioritizing active playback before video thumbnail work.
 - Delayed non-active split-view video thumbnail generation so playback can begin sooner.
@@ -90,7 +96,11 @@ Notes:
 - `double slide`: `1,2 / 2,3 / 3,4`
 - `triple page`: `1,2,3 / 4,5,6`
 - `triple slide`: `1,2,3 / 2,3,4 / 3,4,5`
-- `webtoon`: vertical continuous scrolling
+- `webtoon`: vertical continuous scrolling with optional auto-scroll
+
+In webtoon mode, move the mouse to show the auto-scroll panel near the right
+side of the viewer. The panel hides after a short idle delay. Auto-scroll can
+also be toggled with `Ctrl+Space`, and using the mouse wheel stops auto-scroll.
 
 In split modes, video files show a preview/first-frame style tile when they are
 not the active playback slot. The active slot can play video while surrounding
@@ -134,6 +144,7 @@ Some shortcut changes require restarting the app to rebuild bindings.
 | First file | `Home` |
 | Last file | `End` |
 | Next image with wrap | `Space` |
+| Toggle webtoon auto-scroll | `Ctrl+Space` |
 | Zoom in | `+`, `Ctrl++` |
 | Zoom out | `-`, `Ctrl+-` |
 | Fit height | `H` |
