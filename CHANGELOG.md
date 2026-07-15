@@ -2,6 +2,7 @@
 
 ## v1.0.1
 
+- Retry viewer deletion once after releasing transient image/video worker locks on Windows.
 - 제품을 설치형 `Photo Viewer`로 재브랜딩했습니다.
 - `PhotoViewer.exe`, `PhotoViewer.Image`와 새 설치/제거 항목을 사용합니다.
 - 설정을 사용자 LocalAppData에 저장하고 v1.0.0 설치형 설정을 자동 이전합니다.

@@ -565,8 +565,19 @@ class RebuildTests(unittest.TestCase):
             expected_next = Path(window.media_paths[1])
             self.assertTrue(window.open_viewer_for(first))
 
+            delete_attempts = 0
+
+            def delete_after_one_busy_error(target):
+                nonlocal delete_attempts
+                delete_attempts += 1
+                if delete_attempts == 1:
+                    error = PermissionError("media decoder still owns the file")
+                    error.winerror = 32
+                    raise error
+                Path(target).unlink()
+
             with (
-                mock.patch.object(main, "send_to_recycle_bin", side_effect=lambda target: Path(target).unlink()),
+                mock.patch.object(main, "send_to_recycle_bin", side_effect=delete_after_one_busy_error),
                 mock.patch.object(
                     main.QMessageBox,
                     "warning",
@@ -575,6 +586,7 @@ class RebuildTests(unittest.TestCase):
             ):
                 window.delete_from_viewer(first)
 
+            self.assertEqual(delete_attempts, 2)
             self.assertIs(window.main_stack.currentWidget(), window.viewer)
             self.assertNotIn(first, window.viewer.items)
             self.assertEqual(window.viewer.items[window.viewer.index], expected_next)

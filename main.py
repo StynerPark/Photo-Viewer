@@ -6043,6 +6043,30 @@ class MainWindow(QMainWindow):
         else:
             self.delete_selected()
 
+    @staticmethod
+    def is_media_file_busy_error(error):
+        return isinstance(error, PermissionError) or getattr(error, "winerror", None) in (32, 33)
+
+    def release_media_file_workers(self, timeout_ms=2000):
+        """Release short-lived decoder/player file handles before one delete retry."""
+        self.pause_thumbnail_work(cancel_pending=True)
+        pools = [self.thumbnail_pool]
+        if self.viewer:
+            self.viewer.cancel_pending_decodes()
+            self.viewer.stop_animated_image()
+            self.viewer.stop_media()
+            pools.extend((
+                self.viewer.decode_pool,
+                self.viewer.preload_decode_pool,
+                self.viewer.animated_image_pool,
+            ))
+        deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+        for pool in pools:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining_ms <= 0:
+                break
+            pool.waitForDone(remaining_ms)
+
     def delete_from_viewer(self, path):
         if not self.viewer:
             return
@@ -6052,10 +6076,19 @@ class MainWindow(QMainWindow):
         if path.exists():
             try:
                 send_to_recycle_bin(path)
-            except Exception:
-                QMessageBox.warning(self, "Delete failed", f"Could not move to recycle bin:\n{path}")
-                self.viewer.setFocus()
-                return
+            except Exception as error:
+                if self.is_media_file_busy_error(error):
+                    self.release_media_file_workers()
+                    try:
+                        send_to_recycle_bin(path)
+                    except Exception:
+                        QMessageBox.warning(self, "Delete failed", f"Could not move to recycle bin:\n{path}")
+                        self.viewer.setFocus()
+                        return
+                else:
+                    QMessageBox.warning(self, "Delete failed", f"Could not move to recycle bin:\n{path}")
+                    self.viewer.setFocus()
+                    return
 
         self.media_paths = [item for item in self.media_paths if item != deleted_path]
         self.startup_media_scan_paths = [item for item in self.startup_media_scan_paths if item != deleted_path]
