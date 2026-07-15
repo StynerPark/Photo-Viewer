@@ -80,7 +80,7 @@ python build_exe.py
 ## 테스트
 
 ```powershell
-python -m unittest discover -s tests -p "test_*.py" -v
+python tests/run_all.py
 ```
 
 회귀 테스트는 미디어 끝점 no-op, 빠른 탐색, 웹툰 비율, 애니메이션 워커, 탐색기 복원, 세션 모드, 전면 실행, 뷰어 삭제, UI 구조, 탭 상태, 비동기 스캔·썸네일·VLC와 무한 반복을 검사합니다.
