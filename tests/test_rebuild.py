@@ -565,7 +565,14 @@ class RebuildTests(unittest.TestCase):
             expected_next = Path(window.media_paths[1])
             self.assertTrue(window.open_viewer_for(first))
 
-            with mock.patch.object(main, "send_to_recycle_bin", side_effect=lambda target: Path(target).unlink()):
+            with (
+                mock.patch.object(main, "send_to_recycle_bin", side_effect=lambda target: Path(target).unlink()),
+                mock.patch.object(
+                    main.QMessageBox,
+                    "warning",
+                    side_effect=AssertionError("Viewer deletion unexpectedly opened an error dialog"),
+                ),
+            ):
                 window.delete_from_viewer(first)
 
             self.assertIs(window.main_stack.currentWidget(), window.viewer)
@@ -576,7 +583,14 @@ class RebuildTests(unittest.TestCase):
             window.viewer.index = len(window.viewer.items) - 1
             last = window.viewer.items[-1]
             expected_previous = window.viewer.items[-2]
-            with mock.patch.object(main, "send_to_recycle_bin", side_effect=lambda target: Path(target).unlink()):
+            with (
+                mock.patch.object(main, "send_to_recycle_bin", side_effect=lambda target: Path(target).unlink()),
+                mock.patch.object(
+                    main.QMessageBox,
+                    "warning",
+                    side_effect=AssertionError("Viewer deletion unexpectedly opened an error dialog"),
+                ),
+            ):
                 window.delete_from_viewer(last)
 
             self.assertIs(window.main_stack.currentWidget(), window.viewer)
