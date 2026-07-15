@@ -1,18 +1,71 @@
-import os
+import subprocess
 import sys
-import unittest
+import threading
+import time
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(root))
+command = [
+    sys.executable,
+    "-u",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    str(root / "tests"),
+    "-p",
+    "test_*.py",
+    "-v",
+]
 
-suite = unittest.defaultTestLoader.discover(str(root / "tests"), pattern="test_*.py")
-result = unittest.TextTestRunner(verbosity=2).run(suite)
-exit_code = 0 if result.wasSuccessful() else 1
+process = subprocess.Popen(
+    command,
+    cwd=root,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    bufsize=1,
+)
+success_reported = threading.Event()
 
-# The tests intentionally exercise delayed Qt/VLC cleanup workers. All test
-# assertions and cleanup hooks have completed at this point; avoid waiting for
-# PySide's process-global teardown during non-interactive CI shutdown.
-sys.stdout.flush()
-sys.stderr.flush()
-os._exit(exit_code)
+
+def forward_output():
+    assert process.stdout is not None
+    for line in process.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        if line.strip() == "OK":
+            success_reported.set()
+
+
+reader = threading.Thread(target=forward_output, daemon=True)
+reader.start()
+deadline = time.monotonic() + 600
+
+while process.poll() is None:
+    if success_reported.wait(0.25):
+        # unittest only prints the final uppercase OK after every assertion and
+        # cleanup hook has completed. Qt/VLC can still keep a Windows process
+        # alive during global teardown, so give it a moment and then end only
+        # that already-successful test process.
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        reader.join(timeout=2)
+        raise SystemExit(0)
+    if time.monotonic() >= deadline:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise SystemExit("Regression tests exceeded the 10-minute limit.")
+
+reader.join(timeout=2)
+raise SystemExit(process.returncode)
