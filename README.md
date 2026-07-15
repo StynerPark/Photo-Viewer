@@ -1,209 +1,86 @@
-# Portable Photo Viewer
+# Photo Viewer v1.0.1
 
-Portable Photo Viewer is a Windows portable photo-first viewer and folder browser.
-It is built for fast local photo browsing, full-screen viewing, webtoon-style
-vertical reading, and Japanese manga-style two-page reading. Animated images and
-common video files such as MP4 are supported as companion media, but the main
-identity of the app is a photo viewer.
+Photo Viewer는 Windows용 이미지·영상 뷰어이자 폴더 탐색기입니다. 로컬 및 SMB/UNC 폴더 탐색, 단일·2장·3장·웹툰 보기, 애니메이션 이미지, VLC 기반 영상 재생을 지원합니다.
 
-Portable Photo Viewer는 사진 감상 중심의 Windows 포터블 뷰어입니다. 빠른 폴더 탐색,
-전체화면 감상, 웹툰형 세로 스크롤, 일본 만화식 2페이지 보기를 강점으로 합니다.
-GIF/WebP/APNG 움짤과 MP4 같은 영상 파일도 함께 볼 수 있지만, 기본 성격은 사진
-뷰어입니다.
+## 다운로드
 
-## Download
+최신 설치 파일은 [GitHub Releases](https://github.com/StynerPark/Photo-Viewer/releases/latest)에서 받을 수 있습니다.
 
-Download the ready-to-run portable build from GitHub Releases:
+- 설치 파일: `PhotoViewer_v1.0.1_Setup.exe`
+- 이전 등록 정리 도구: `PhotoViewer_DefaultApp_Reset_v1.0.1.exe`
+- Windows 10/11 x64
+- 현재 배포 파일은 코드 서명이 없으므로 Windows SmartScreen 안내가 표시될 수 있습니다.
 
-https://github.com/StynerPark/Portable-image-Viewer/releases
+## v1.0.1 핵심 변경
 
-Extract the zip file and run `PortableMediaViewer.exe`.
+- 설치형 제품명, 창 제목, 실행 파일과 Windows 메타데이터를 `Photo Viewer` / `PhotoViewer.exe`로 통일했습니다.
+- 설정은 `%LocalAppData%\Photo Viewer\settings.json`에 저장합니다.
+- 기존 `%LocalAppData%\Portable Photo Viewer\settings.json`은 새 설정이 없을 때 한 번 자동 복사합니다.
+- 설치 완료 후 Windows 기본 앱 설정 화면을 자동으로 열지 않습니다.
+- 설치할 이미지 확장자 39개를 사용자가 선택할 수 있으며 영상 확장자는 등록하지 않습니다.
+- 사용자용과 전체 사용자용 중복 설치를 차단합니다.
+- 연결된 이미지를 더블클릭하면 뷰어가 전면으로 열립니다.
+- 단일·2장·3장 영상 슬롯의 재생, 무한 반복과 빠른 영상 전환을 유지합니다.
+- 뷰어 삭제 후 탐색기로 강제 전환하지 않고 다음 미디어를 계속 표시합니다.
+- 탐색기 폴더 트리 구조와 사용자가 조절한 스플리터 크기를 유지합니다.
+- 폴더 진입·복귀·탭 전환·썸네일·모드 전환 작업의 비동기 처리와 취소 로직을 유지합니다.
+- 웹툰 모드의 원본 종횡비, 가시 영역 우선 로딩과 제한된 캐시를 유지합니다.
+- 처음/끝에서 휠·PageUp·PageDown 입력은 현재 미디어를 다시 로드하지 않는 no-op입니다.
 
-압축을 풀고 `PortableMediaViewer.exe`를 실행하면 됩니다.
+전체 변경 이력은 [CHANGELOG.md](CHANGELOG.md)를 참고하십시오.
 
-## Supported Formats / 지원 확장자
+## 지원 형식
 
-Photo and image formats:
+이미지:
 
-`jpg`, `jpeg`, `jpe`, `png`, `apng`, `bmp`, `gif`, `webp`, `avif`, `avifs`,
-`tif`, `tiff`, `ico`, `jfif`, `ppm`, `pgm`, `pbm`, `pnm`, `jp2`, `j2k`,
-`j2c`, `jpc`, `jpf`, `jpx`, `tga`, `icb`, `vda`, `vst`, `dds`, `psd`, `pcx`,
-`qoi`, `sgi`, `rgb`, `rgba`, `bw`, `ras`, `xbm`, `xpm`
+`apng`, `avif`, `avifs`, `bmp`, `bw`, `dds`, `gif`, `icb`, `ico`, `j2c`, `j2k`, `jfif`, `jp2`, `jpc`, `jpe`, `jpeg`, `jpf`, `jpg`, `jpx`, `pbm`, `pcx`, `pgm`, `png`, `pnm`, `ppm`, `psd`, `qoi`, `ras`, `rgb`, `rgba`, `sgi`, `tga`, `tif`, `tiff`, `vda`, `vst`, `webp`, `xbm`, `xpm`
 
-Animated image formats:
+영상:
 
-`gif`, `webp`, `apng`
+`mp4`, `mkv`, `avi`, `mov`, `webm`, `wmv`, `flv`, `m4v`, `mpeg`, `mpg`, `ts`, `m2ts`, `3gp`, `ogv`
 
-Video formats:
+압축 파일: `zip`
 
-`mp4`, `mkv`, `avi`, `mov`, `webm`, `wmv`, `flv`, `m4v`, `mpeg`, `mpg`, `ts`,
-`m2ts`, `3gp`, `ogv`
+## 주요 기능
 
-Archive browsing:
+- Windows 스타일 폴더 트리, 다중 탭, 주소 입력과 빠른 검색
+- 상세·목록·중간·큰 아이콘 보기와 이름·크기·형식·날짜 정렬
+- 단일·더블·트리플·웹툰 뷰어 모드
+- GIF, Animated WebP, APNG 재생
+- VLC/libVLC 영상 재생, 탐색, 음량, 정지와 무한 반복
+- 이미지 확대·축소·회전·맞춤과 잠금
+- 복사·잘라내기·붙여넣기·이름 변경·휴지통 삭제
+- 라이트/다크 테마와 사용자 단축키
+- 단일/다중 인스턴스 실행
 
-`zip`
+## 설치 및 연결
 
-Notes:
+설치기는 현재 사용자 또는 모든 사용자를 선택하고, 설치 경로와 연결 후보 이미지 확장자를 지정할 수 있습니다. Windows 10/11은 기본 앱 확정을 사용자 선택으로 보호하므로 필요한 경우 이미지 파일을 더블클릭하고 `Photo Viewer`를 선택하십시오.
 
-- HEIC/HEIF is not enabled yet because the current bundled image stack does not
-  include a HEIC decoder.
-- PDF/SVG/EPS/WMF/EMF are intentionally not listed as photo formats yet because
-  their behavior is closer to document/vector viewing than photo viewing.
-- PSD support is intended for flattened preview-style viewing, not full layer
-  editing.
+이전 공개판이나 시험판의 등록을 먼저 지우려면 릴리스의 `PhotoViewer_DefaultApp_Reset_v1.0.1.exe`를 실행하십시오. 사진, 사용자 설정과 다른 앱 등록은 삭제하지 않습니다.
 
-## Main Features / 주요 기능
-
-- Windows-style folder tree navigation
-- Local folders, app-only shortcuts, and tabbed folder browsing
-- Thumbnail, list, details, and icon-style explorer views
-- Sort by name, size, type, modified date, and image properties
-- Direct address input, including local paths and SMB/UNC paths such as `\\server`
-- ZIP files open like folders for image viewing
-- Viewer mode opens from double-click or `Enter`
-- Full-screen photo viewing with mouse wheel/page navigation
-- Drag-to-pan viewing when zoomed images are larger than the viewer
-- Single, double, triple, and webtoon viewer modes
-- Japanese manga-style double page order: `2,1 / 4,3`
-- Webtoon mode with vertical continuous scrolling
-- Webtoon auto-scroll with slow, normal, fast, and manual speed controls
-- Webtoon loading optimized with visible-range priority, fixed target width, 4K
-  width cap, scaled decoding, and memory cache
-- GIF, animated WebP, and APNG support
-- Video playback through VLC/libVLC with play/stop, seek, time, and volume controls
-- Copy, paste, rename, delete, and recycle-bin deletion in explorer and viewer modes
-- Light/dark theme
-- Multi-instance and single-instance launch modes
-- Portable settings saved next to the executable in `settings.json`
-
-## Recent Improvements
-
-- Improved double-click startup responsiveness by opening the selected media first
-  and expanding the surrounding folder media list immediately after the viewer is shown.
-- Kept mixed photo/video viewer stabilization intact while avoiding full folder
-  media collection before the first viewer frame.
-- Reduced white flashes and transient child-window artifacts during fast viewer navigation.
-- Improved MP4 startup responsiveness on low-end PCs by prioritizing active playback before video thumbnail work.
-- Delayed non-active split-view video thumbnail generation so playback can begin sooner.
-- Skipped video files from adjacent viewer preload queues to reduce CPU and disk pressure while browsing quickly.
-- Kept split-view video previews available while avoiding unnecessary first-load thumbnail extraction for the active video slot.
-
-## Viewer Modes / 뷰어 모드
-
-- `single`: one file at a time
-- `double page`: `1,2 / 3,4`
-- `double manga`: `2,1 / 4,3`
-- `double slide`: `1,2 / 2,3 / 3,4`
-- `triple page`: `1,2,3 / 4,5,6`
-- `triple slide`: `1,2,3 / 2,3,4 / 3,4,5`
-- `webtoon`: vertical continuous scrolling with optional auto-scroll
-
-In webtoon mode, move the mouse to show the auto-scroll panel near the right
-side of the viewer. The panel hides after a short idle delay. Auto-scroll can
-also be toggled with `Ctrl+Space`, and using the mouse wheel stops auto-scroll.
-
-In split modes, video files show a preview/first-frame style tile when they are
-not the active playback slot. The active slot can play video while surrounding
-items remain as previews.
-
-## Opening Files / 파일 열기
-
-- Launching the app normally opens the default Documents folder.
-- Opening an associated image/video file from Windows opens directly in viewer mode.
-- Leaving viewer mode returns to the folder that contains the opened file.
-- Normal startup does not restore the last private folder, so previous photo
-  locations are not exposed automatically.
-- In `single` instance mode, opening another file while the app is already open
-  reuses the existing window instead of starting another copy.
-
-## Settings / 설정
-
-The settings window is intentionally hidden from the main toolbar. Press `F1` to
-open it.
-
-설정창은 기본 화면에 버튼으로 노출하지 않습니다. `F1`을 누르면 열립니다.
-
-You can change:
-
-- Theme: `dark` or `light`
-- Instance mode: `multi` or `single`
-- Keyboard shortcuts
-- Mouse shortcut tokens: `MouseMiddle`, `MouseBack`, `MouseForward`, `WheelUp`, `WheelDown`
-- Multiple shortcuts for the same action
-
-Some shortcut changes require restarting the app to rebuild bindings.
-
-## Default Shortcuts / 기본 단축키
-
-| Action | Default shortcut |
-| --- | --- |
-| Open viewer | `Enter` |
-| Toggle fullscreen | `F11`, middle mouse button |
-| Next file | mouse wheel down, `PageDown` |
-| Previous file | mouse wheel up, `PageUp` |
-| First file | `Home` |
-| Last file | `End` |
-| Next image with wrap | `Space` |
-| Toggle webtoon auto-scroll | `Ctrl+Space` |
-| Zoom in | `+`, `Ctrl++` |
-| Zoom out | `-`, `Ctrl+-` |
-| Fit height | `H` |
-| Fit width | `W` |
-| Actual size | `1` |
-| Toggle zoom lock | `L` |
-| Rotate right | `R` |
-| Rotate left | `Shift+R` |
-| Back | `Alt+Left`, mouse back button |
-| Forward | `Alt+Right`, mouse forward button |
-| Rename | `F2` |
-| Copy | `Ctrl+C` |
-| Paste | `Ctrl+V` |
-| Delete | `Delete` |
-| Open settings | `F1` |
-
-In image viewer mode, `Space` moves to the next file and wraps from the last file
-back to the first. During video playback, video play/pause behavior can take
-priority.
-
-## Portable Files / 포터블 구성
-
-The portable release includes:
-
-- `PortableMediaViewer.exe`
-- `_internal`
-- `vlc`
-- `README.md`
-- `settings.json`
-- `settings.example.json`
-
-Keep these files together. The VLC runtime is required for broad video playback.
-
-## Run From Source
-
-Install dependencies:
+## 소스 실행
 
 ```powershell
 python -m pip install -r requirements.txt
-```
-
-Run:
-
-```powershell
 python main.py
 ```
 
-For video playback, place a VLC/libVLC runtime folder named `vlc` next to
-`main.py`.
+영상 재생에는 VLC 3.x x64 런타임이 필요합니다. `main.py` 옆의 `vlc` 폴더 또는 `PMV_VLC_SOURCE` 환경 변수로 런타임 경로를 제공합니다.
 
-## Build
+## EXE 빌드
 
 ```powershell
+$env:PHOTO_VIEWER_VLC_SOURCE = 'C:\path\to\vlc'
 python build_exe.py
 ```
 
-The build output is created under `dist/PortableMediaViewer`.
+결과는 `dist\PhotoViewer\PhotoViewer.exe`에 생성됩니다. 설치기 빌드에는 Inno Setup 7이 필요하며 `installer\PhotoViewer.iss`를 컴파일합니다.
 
-## Repository And Releases
+## 테스트
 
-Source code is published in this repository. Ready-to-run portable builds are
-attached to GitHub Releases.
+```powershell
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+회귀 테스트는 미디어 끝점 no-op, 빠른 탐색, 웹툰 비율, 애니메이션 워커, 탐색기 복원, 세션 모드, 전면 실행, 뷰어 삭제, UI 구조, 탭 상태, 비동기 스캔·썸네일·VLC와 무한 반복을 검사합니다.

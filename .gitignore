@@ -1,16 +1,12 @@
 __pycache__/
 *.py[cod]
-
 build/
 dist/
-*.spec
-
-settings.json
-.thumb_cache/
-
+release/
 vlc/
-
+settings.json
+*.spec
+*.log
 .venv/
 venv/
-env/
 
