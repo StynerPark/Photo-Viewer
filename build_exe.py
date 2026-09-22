@@ -8,8 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PYTHON = Path(sys.executable)
 DIST = ROOT / "dist" / "PhotoViewer"
-ICON = ROOT / "app.ico"
-VERSION_FILE = ROOT / "version_info.txt"
+SPEC_FILE = ROOT / "PhotoViewer.spec"
 
 
 def locate_vlc_source():
@@ -38,6 +37,12 @@ def generate_vlc_cache(vlc_dir):
 
 def main():
     vlc_source = locate_vlc_source()
+    if vlc_source is None:
+        raise FileNotFoundError(
+            "VLC runtime is required for a distributable build. "
+            "Set PHOTO_VIEWER_VLC_SOURCE to a folder containing libvlc.dll "
+            "and plugins, or place that runtime in dist\\PhotoViewer\\vlc."
+        )
     with tempfile.TemporaryDirectory(prefix="photo-viewer-vlc-build-") as tempdir:
         staged_vlc = None
         if vlc_source is not None and DIST in vlc_source.parents:
@@ -50,17 +55,7 @@ def main():
             "PyInstaller",
             "--noconfirm",
             "--clean",
-            "--onedir",
-            "--noconsole",
-            "--name",
-            "PhotoViewer",
-            "--icon",
-            str(ICON),
-            "--version-file",
-            str(VERSION_FILE),
-            "--add-data",
-            f"{ICON}{';' if sys.platform == 'win32' else ':'}.",
-            str(ROOT / "main.py"),
+            str(SPEC_FILE),
         ], cwd=ROOT)
         if vlc_source is not None:
             target = DIST / "vlc"

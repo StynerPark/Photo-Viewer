@@ -1,6 +1,8 @@
 import json
+import math
 import os
 import queue
+import re
 import shutil
 import stat as stat_module
 import subprocess
@@ -11,13 +13,15 @@ import threading
 import time
 import zipfile
 import copy
+from collections import deque
+import bisect
 from io import BytesIO
 from ctypes import wintypes
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "1.0.1"
+APP_VERSION = "2.0.0"
 LEGACY_APP_NAME = "Portable Photo Viewer"
 INSTANCE_SERVER_NAME = "StynerPark_PhotoViewer_Instance"
 DEFAULT_LAST_FOLDER_SETTING = r"%USERPROFILE%\Documents"
@@ -29,7 +33,7 @@ def resolve_settings_path(run_dir=None, local_appdata=None):
     if local_appdata is None:
         local_appdata = os.environ.get("LOCALAPPDATA")
     settings_root = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-    return settings_root / APP_NAME / "settings.json"
+    return settings_root / APP_NAME / APP_VERSION / "settings.json"
 
 
 def migrate_legacy_settings(settings_path=None, local_appdata=None):
@@ -41,12 +45,17 @@ def migrate_legacy_settings(settings_path=None, local_appdata=None):
     if local_appdata is None:
         local_appdata = os.environ.get("LOCALAPPDATA")
     settings_root = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-    legacy = settings_root / LEGACY_APP_NAME / "settings.json"
-    if not legacy.exists():
-        return False
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(legacy, target)
-    return True
+    legacy_candidates = (
+        settings_root / APP_NAME / "settings.json",
+        settings_root / LEGACY_APP_NAME / "settings.json",
+    )
+    for legacy in legacy_candidates:
+        if not legacy.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy, target)
+        return True
+    return False
 
 
 SETTINGS_PATH = resolve_settings_path()
@@ -74,6 +83,8 @@ from PIL import Image
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
+    QBuffer,
+    QByteArray,
     QDir,
     QEvent,
     QFileInfo,
@@ -89,9 +100,10 @@ from PySide6.QtCore import (
     Qt,
     QTimer,
     QUrl,
+    QIODevice,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QIntValidator, QKeySequence, QMovie, QPainter, QPalette, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QCursor, QFont, QFontMetrics, QIcon, QImage, QImageReader, QIntValidator, QKeySequence, QMovie, QPainter, QPalette, QPen, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -122,6 +134,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTabBar,
@@ -131,12 +145,40 @@ from PySide6.QtWidgets import (
     QTreeView,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 try:
     import vlc
 except Exception:
     vlc = None
+
+
+if vlc is not None:
+    class _VlcMediaTrackUnion(ctypes.Union):
+        _fields_ = [
+            ("audio", ctypes.POINTER(vlc.AudioTrack)),
+            ("video", ctypes.POINTER(vlc.VideoTrack)),
+            ("subtitle", ctypes.POINTER(vlc.SubtitleTrack)),
+        ]
+
+
+    class _VlcMediaTrack(ctypes.Structure):
+        # python-vlc 3.0.21203 models the C union as three consecutive
+        # pointers.  VLC 3.x uses a real union, so use the native layout when
+        # reading SAR and orientation from libvlc_media_tracks_get().
+        _fields_ = [
+            ("codec", ctypes.c_uint32),
+            ("original_fourcc", ctypes.c_uint32),
+            ("id", ctypes.c_int),
+            ("type", vlc.TrackType),
+            ("profile", ctypes.c_int),
+            ("level", ctypes.c_int),
+            ("track", _VlcMediaTrackUnion),
+            ("bitrate", ctypes.c_uint),
+            ("language", ctypes.c_char_p),
+            ("description", ctypes.c_char_p),
+        ]
 
 
 IMAGE_EXTS = {
@@ -168,10 +210,172 @@ PERFORMANCE_PROFILES = {
     "fast": {"thumbnail_workers": 3, "thumbnail_start_ms": 80, "thumbnail_gap_ms": 30},
 }
 
+
+@dataclass(frozen=True)
+class PerformancePolicy:
+    """Runtime limits used by the existing performance-profile control.
+
+    The visible settings and their labels remain unchanged.  ``balanced`` is
+    the normal-user policy (16 GB RAM / 6 cores / 12 threads class hardware),
+    while ``conservative`` is the optional low-spec policy.  Keeping these
+    values in one immutable object prevents individual workers from silently
+    choosing conflicting limits.
+    """
+
+    name: str
+    low_spec: bool
+    thumbnail_workers: int
+    thumbnail_start_ms: int
+    thumbnail_gap_ms: int
+    viewer_decode_workers: int
+    animation_workers: int
+    viewer_cache_limit_bytes: int
+    webtoon_cache_limit_bytes: int
+    thumbnail_cache_limit_bytes: int
+    max_animated_frame_pixels: int
+    video_standby_target: int
+    viewer_lookahead: int
+    webtoon_lookahead: int
+    idle_webtoon_preload: bool
+    decode_dimension_limit: int
+
+
+# Existing PERFORMANCE_PROFILES is intentionally retained for compatibility
+# with settings files and integrations.  The richer policy below is internal;
+# it does not add or remove a settings-widget row.
+PERFORMANCE_POLICIES = {
+    "conservative": PerformancePolicy(
+        name="conservative",
+        low_spec=True,
+        thumbnail_workers=1,
+        thumbnail_start_ms=150,
+        thumbnail_gap_ms=100,
+        viewer_decode_workers=1,
+        animation_workers=1,
+        viewer_cache_limit_bytes=64 * 1024 * 1024,
+        webtoon_cache_limit_bytes=96 * 1024 * 1024,
+        thumbnail_cache_limit_bytes=64 * 1024 * 1024,
+        max_animated_frame_pixels=4 * 1024 * 1024,
+        video_standby_target=1,
+        viewer_lookahead=0,
+        webtoon_lookahead=1,
+        idle_webtoon_preload=False,
+        decode_dimension_limit=3072,
+    ),
+    "balanced": PerformancePolicy(
+        name="balanced",
+        low_spec=False,
+        thumbnail_workers=2,
+        thumbnail_start_ms=100,
+        thumbnail_gap_ms=50,
+        viewer_decode_workers=2,
+        animation_workers=3,
+        viewer_cache_limit_bytes=128 * 1024 * 1024,
+        webtoon_cache_limit_bytes=192 * 1024 * 1024,
+        thumbnail_cache_limit_bytes=128 * 1024 * 1024,
+        max_animated_frame_pixels=16 * 1024 * 1024,
+        video_standby_target=3,
+        viewer_lookahead=1,
+        webtoon_lookahead=2,
+        idle_webtoon_preload=True,
+        decode_dimension_limit=4096,
+    ),
+    "fast": PerformancePolicy(
+        name="fast",
+        low_spec=False,
+        thumbnail_workers=3,
+        thumbnail_start_ms=80,
+        thumbnail_gap_ms=30,
+        viewer_decode_workers=3,
+        animation_workers=2,
+        viewer_cache_limit_bytes=160 * 1024 * 1024,
+        webtoon_cache_limit_bytes=256 * 1024 * 1024,
+        thumbnail_cache_limit_bytes=160 * 1024 * 1024,
+        max_animated_frame_pixels=24 * 1024 * 1024,
+        video_standby_target=4,
+        viewer_lookahead=2,
+        webtoon_lookahead=3,
+        idle_webtoon_preload=True,
+        decode_dimension_limit=5120,
+    ),
+}
+
+
+def performance_policy_for(settings):
+    """Return a validated runtime policy without changing the settings UI."""
+    profile = str((settings or {}).get("performance_profile", "balanced")).lower()
+    if profile not in PERFORMANCE_POLICIES:
+        profile = "balanced"
+    # ``low_spec_mode`` is intentionally a backwards-compatible, hidden JSON
+    # switch.  Existing users keep the same visible controls, while advanced
+    # deployments can force the conservative lifecycle limits independently.
+    if bool((settings or {}).get("low_spec_mode", False)):
+        profile = "conservative"
+    return PERFORMANCE_POLICIES[profile]
+
 VIEWER_CACHE_LIMIT_BYTES = 128 * 1024 * 1024
 WEBTOON_CACHE_LIMIT_BYTES = 192 * 1024 * 1024
 THUMBNAIL_CACHE_LIMIT_BYTES = 128 * 1024 * 1024
 MAX_ANIMATED_FRAME_PIXELS = 16 * 1024 * 1024
+THUMBNAIL_WHEEL_ROWS = 3
+THUMBNAIL_TOUCHPAD_SCALE = 2.0
+PLAYBACK_RATE_PRESETS = (0.25, 0.5, 0.75, 1.0, 2.0)
+PLAYBACK_RATE_MIN = 0.1
+PLAYBACK_RATE_MAX = 4.0
+VIDEO_INITIAL_PLAYER_TARGET = 1
+VIDEO_STANDBY_TARGET = 6
+VIDEO_MAX_FRAMES_PER_SLOT = 3
+VIDEO_CLEANUP_IDLE_MS = 15
+VIDEO_READY_TIMEOUT_MS = 8000
+VIDEO_START_TIMEOUT_MS = 5000
+VLC_INSTANCE_ARGS = (
+    "--quiet",
+)
+
+VIEWER_POPUP_MENU_STYLE = """
+    QMenu {
+        background: #211e29;
+        color: #f5f1fc;
+        border: 1px solid #5d5275;
+        border-radius: 7px;
+        padding: 5px;
+    }
+    QMenu::item {
+        background: transparent;
+        color: #f5f1fc;
+        min-width: 92px;
+        padding: 6px 22px 6px 12px;
+        border-radius: 5px;
+    }
+    QMenu::item:selected { background: #7560b4; color: #ffffff; }
+    QMenu::item:disabled { color: #858091; }
+    QMenu::separator { height: 1px; background: #4b445d; margin: 4px 7px; }
+"""
+
+VIEWER_COMBO_POPUP_STYLE = """
+    QAbstractItemView {
+        background-color: #211e29;
+        color: #f5f1fc;
+        border: 1px solid #5d5275;
+        border-radius: 7px;
+        outline: 0;
+        padding: 4px;
+        selection-background-color: #7560b4;
+        selection-color: #ffffff;
+    }
+    QAbstractItemView::item {
+        background-color: #211e29;
+        color: #f5f1fc;
+        min-height: 26px;
+        padding: 3px 10px;
+        border-radius: 5px;
+    }
+    QAbstractItemView::item:hover,
+    QAbstractItemView::item:selected {
+        background-color: #7560b4;
+        color: #ffffff;
+    }
+"""
 
 
 DEFAULT_SETTINGS = {
@@ -188,6 +392,9 @@ DEFAULT_SETTINGS = {
     "theme": "dark",
     "instance_mode": "multi",
     "performance_profile": "balanced",
+    # Internal policy switch; no new UI control is introduced so the existing
+    # layout/right-click/shortcut surface remains unchanged.
+    "low_spec_mode": False,
     "webtoon_auto_scroll_speed_mode": "normal",
     "webtoon_auto_scroll_manual_speed": 120,
     "quick_paths": [],
@@ -242,8 +449,49 @@ def load_settings():
 
 
 def save_settings(settings):
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    """Persist settings atomically so a forced shutdown cannot corrupt JSON."""
+    temp_name = None
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(SETTINGS_PATH.parent),
+            prefix=f".{SETTINGS_PATH.stem}-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            json.dump(settings, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, SETTINGS_PATH)
+        return True
+    except Exception:
+        # Settings are best-effort; a read-only profile must not prevent the
+        # viewer from starting or closing.  Remove only the temporary file we
+        # created, never the user's existing settings.
+        if temp_name:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return False
+
+
+def natural_sort_key(value):
+    """Return a case-insensitive key that compares digit runs numerically."""
+    parts = []
+    for token in re.split(r"(\d+)", str(value).casefold()):
+        if not token:
+            continue
+        if token.isdigit():
+            # Shorter digit runs win when the numeric value is equal:
+            # 1.jpg, 01.jpg, 001.jpg.
+            parts.append((0, int(token), len(token)))
+        else:
+            parts.append((1, token))
+    return tuple(parts)
 
 
 def is_image(path):
@@ -260,6 +508,58 @@ def is_media(path):
 
 def is_archive(path):
     return Path(path).suffix.lower() in ARCHIVE_EXTS
+
+
+def normalize_playback_rate(value):
+    try:
+        text = str(value).strip().lower()
+        if text.endswith("x"):
+            text = text[:-1].strip()
+        rate = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(rate) or not PLAYBACK_RATE_MIN <= rate <= PLAYBACK_RATE_MAX:
+        return None
+    return round(rate, 3)
+
+
+def format_playback_rate(value):
+    rate = normalize_playback_rate(value)
+    if rate is None:
+        rate = 1.0
+    if math.isclose(rate, round(rate), abs_tol=0.0005):
+        return f"{rate:.1f}x"
+    return f"{rate:.3f}".rstrip("0").rstrip(".") + "x"
+
+
+def animated_webp_frame_durations(path):
+    """Return ANMF frame durations without decoding the complete WebP image."""
+    path = Path(path)
+    if path.suffix.lower() != ".webp":
+        return []
+    durations = []
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(12)
+            if len(header) != 12 or header[:4] != b"RIFF" or header[8:] != b"WEBP":
+                return []
+            while True:
+                chunk_header = handle.read(8)
+                if len(chunk_header) < 8:
+                    break
+                chunk_type = chunk_header[:4]
+                chunk_size = int.from_bytes(chunk_header[4:8], "little")
+                if chunk_type == b"ANMF" and chunk_size >= 16:
+                    frame_header = handle.read(16)
+                    durations.append(max(10, int.from_bytes(frame_header[12:15], "little") or 80))
+                    handle.seek(chunk_size - 16, os.SEEK_CUR)
+                else:
+                    handle.seek(chunk_size, os.SEEK_CUR)
+                if chunk_size & 1:
+                    handle.seek(1, os.SEEK_CUR)
+    except (OSError, ValueError):
+        return []
+    return durations
 
 
 def unc_server_name(text):
@@ -349,37 +649,91 @@ def image_type(path):
         return Path(path).suffix.upper().strip(".")
 
 
-def type_color(path, is_dir_entry=False):
+TYPE_BADGE_COLORS = {
+    "jpeg": "#a2ad45",
+    "png": "#b96e63",
+    "webp": "#7d9850",
+    "gif": "#48a66a",
+    "video": "#4e9db1",
+    "raster": "#b38a4b",
+    "other": "#80788f",
+}
+
+TYPE_ROW_COLORS = {
+    "light": {
+        "jpeg": "#f0f2d8",
+        "png": "#f5e2df",
+        "webp": "#e7eedb",
+        "gif": "#dff1e5",
+        "video": "#deedf1",
+        "raster": "#f2e8d8",
+        "other": "#eeebf1",
+    },
+    "dark": {
+        "jpeg": "#343724",
+        "png": "#3a292d",
+        "webp": "#2c3528",
+        "gif": "#24372c",
+        "video": "#26383f",
+        "raster": "#3a3127",
+        "other": "#302c37",
+    },
+}
+
+
+def type_color_key(path, is_dir_entry=False):
     if is_dir_entry or is_archive(path):
         return None
     ext = Path(path).suffix.lower()
-    if ext in {".jpg", ".jpeg", ".jfif"}:
-        color = QColor("#a2ad45")
-        color.setAlpha(78)
-        return color
-    if ext == ".png":
-        color = QColor("#b96e63")
-        color.setAlpha(76)
-        return color
+    if ext in {".jpg", ".jpeg", ".jpe", ".jfif"}:
+        return "jpeg"
+    if ext in {".png", ".apng"}:
+        return "png"
     if ext == ".webp":
-        color = QColor("#7d9850")
-        color.setAlpha(76)
-        return color
+        return "webp"
     if ext == ".gif":
-        color = QColor("#48a66a")
-        color.setAlpha(72)
-        return color
-    if ext in {".mp4", ".avi", ".mkv", ".mov", ".webm", ".wmv", ".flv", ".m4v", ".mpeg", ".mpg", ".ts", ".m2ts", ".3gp", ".ogv"}:
-        color = QColor("#4e9db1")
-        color.setAlpha(74)
-        return color
+        return "gif"
+    if ext in VIDEO_EXTS:
+        return "video"
     if ext in {".bmp", ".tif", ".tiff", ".ico", ".ppm", ".pgm", ".pbm", ".pnm"}:
-        color = QColor("#b38a4b")
-        color.setAlpha(74)
-        return color
-    color = QColor("#80788f")
-    color.setAlpha(60)
-    return color
+        return "raster"
+    return "other"
+
+
+def type_color(path, is_dir_entry=False, dark_theme=False):
+    color_key = type_color_key(path, is_dir_entry)
+    if color_key is None:
+        return None
+    theme = "dark" if dark_theme else "light"
+    return QColor(TYPE_ROW_COLORS[theme][color_key])
+
+
+def type_badge_color(path, is_dir_entry=False):
+    color_key = type_color_key(path, is_dir_entry)
+    if color_key is None:
+        return None
+    return QColor(TYPE_BADGE_COLORS[color_key])
+
+
+def extension_badge_text(path, is_dir_entry=False):
+    if is_dir_entry or is_archive(path) or not is_media(path):
+        return ""
+    return Path(path).suffix.upper().lstrip(".")
+
+
+def contrasting_text_color(background):
+    def linear_channel(value):
+        value = value / 255.0
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+    luminance = (
+        0.2126 * linear_channel(background.red())
+        + 0.7152 * linear_channel(background.green())
+        + 0.0722 * linear_channel(background.blue())
+    )
+    black_contrast = (luminance + 0.05) / 0.05
+    white_contrast = 1.05 / (luminance + 0.05)
+    return QColor("#17131d" if black_contrast >= white_contrast else "#ffffff")
 
 
 def fmt_modified(path):
@@ -450,12 +804,85 @@ class FolderSnapshot:
     signature: tuple
 
 
+class ArchiveSession:
+    """Metadata session for a ZIP with independent member readers.
+
+    ``ZipFile.open`` is not safe to share while several viewer/thumbnail
+    workers are active.  Metadata remains on the session handle, but each
+    member read opens its own short-lived handle so one slow image cannot
+    serialize every other image request.
+    """
+
+    def __init__(self, archive_path):
+        self.archive_path = str(archive_path)
+        self._lock = threading.RLock()
+        self._archive = zipfile.ZipFile(self.archive_path)
+        self._closed = False
+
+    def image_members(self):
+        with self._lock:
+            if self._closed:
+                return []
+            return [
+                info
+                for info in self._archive.infolist()
+                if not info.is_dir() and Path(info.filename).suffix.lower() in IMAGE_EXTS
+            ]
+
+    def read_member(self, member_name, cancel_check=None):
+        chunks = []
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Archive session is closed")
+            archive_path = self.archive_path
+        # Do not hold the session lock during decompression.  A separate
+        # handle gives concurrent decode tasks independent file pointers and
+        # also makes cancellation responsive between chunks.
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            with archive.open(member_name) as source:
+                while True:
+                    if cancel_check is not None and cancel_check():
+                        raise InterruptedError
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+        return b"".join(chunks)
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._archive.close()
+
+
+@dataclass(frozen=True)
+class ArchiveMemberSource:
+    session: object
+    member_name: str
+
+    def read(self, cancel_check=None):
+        return self.session.read_member(self.member_name, cancel_check=cancel_check)
+
+
 class DecodeSignals(QObject):
     finished = Signal(int, str, object, object)
 
 
 class ImageDecodeTask(QRunnable):
-    def __init__(self, generation, path, max_size, canvas_size=None, video_shell=False, thread_priority=QThread.LowPriority):
+    def __init__(
+        self,
+        generation,
+        path,
+        max_size,
+        canvas_size=None,
+        video_shell=False,
+        thread_priority=QThread.LowPriority,
+        archive_source=None,
+        render_token=0,
+        cache_key=None,
+    ):
         super().__init__()
         self.generation = int(generation)
         self.path = str(path)
@@ -463,6 +890,9 @@ class ImageDecodeTask(QRunnable):
         self.canvas_size = tuple(canvas_size) if canvas_size else None
         self.video_shell = bool(video_shell)
         self.thread_priority = thread_priority
+        self.archive_source = archive_source
+        self.render_token = int(render_token)
+        self.cache_key = cache_key
         self.cancelled = False
         self.signals = DecodeSignals()
 
@@ -471,7 +901,7 @@ class ImageDecodeTask(QRunnable):
 
     def run(self):
         payload = None
-        metadata = {}
+        metadata = {"render_token": self.render_token, "cache_key": self.cache_key}
         try:
             if self.cancelled:
                 raise InterruptedError
@@ -479,14 +909,85 @@ class ImageDecodeTask(QRunnable):
             path = Path(self.path)
             if self.video_shell:
                 payload = windows_shell_thumbnail_image(path, max(self.max_size))
+            elif self.archive_source is not None:
+                source_bytes = self.archive_source.read(cancel_check=lambda: self.cancelled)
+                if self.cancelled:
+                    raise InterruptedError
+                byte_array = QByteArray(source_bytes)
+                buffer = QBuffer()
+                buffer.setData(byte_array)
+                if not buffer.open(QIODevice.ReadOnly):
+                    raise OSError("Cannot open archive image buffer")
+                reader = QImageReader(buffer)
+                source_size = reader.size()
+                if source_size.isValid() and source_size.width() > 0 and source_size.height() > 0:
+                    metadata.update({
+                        "image_size": (source_size.width(), source_size.height()),
+                        "image_format": bytes(reader.format()).decode("ascii", errors="ignore").upper(),
+                        "animated": bool(reader.supportsAnimation() and reader.imageCount() != 1),
+                        "frame_count": max(1, int(reader.imageCount() or 1)),
+                    })
+                    max_width = max(1, int(self.max_size[0]))
+                    max_height = max(1, int(self.max_size[1]))
+                    scale = min(1.0, max_width / source_size.width(), max_height / source_size.height())
+                    if scale < 1.0:
+                        reader.setScaledSize(QSize(
+                            max(1, int(source_size.width() * scale)),
+                            max(1, int(source_size.height() * scale)),
+                        ))
+                    image = reader.read()
+                    if not image.isNull():
+                        if self.canvas_size:
+                            canvas = QImage(
+                                max(1, int(self.canvas_size[0])),
+                                max(1, int(self.canvas_size[1])),
+                                QImage.Format_ARGB32,
+                            )
+                            canvas.fill(QColor("#050505"))
+                            scaled = image.scaled(canvas.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                            painter = QPainter(canvas)
+                            painter.drawImage(
+                                (canvas.width() - scaled.width()) // 2,
+                                (canvas.height() - scaled.height()) // 2,
+                                scaled,
+                            )
+                            painter.end()
+                            payload = canvas
+                        else:
+                            payload = image
+                if payload is None:
+                    with Image.open(BytesIO(source_bytes)) as source:
+                        frame_count = max(1, int(getattr(source, "n_frames", 1) or 1))
+                        metadata.update({
+                            "image_size": (int(source.width), int(source.height)),
+                            "image_format": str(source.format or path.suffix.upper().strip(".")),
+                            "animated": bool(getattr(source, "is_animated", False) and frame_count > 1),
+                            "frame_count": frame_count,
+                        })
+                        if getattr(source, "is_animated", False):
+                            source.seek(0)
+                        image = source.convert("RGBA")
+                        image.thumbnail(self.max_size, Image.Resampling.LANCZOS)
+                        if self.canvas_size:
+                            canvas = Image.new("RGBA", self.canvas_size, (0, 0, 0, 255))
+                            canvas.alpha_composite(
+                                image,
+                                ((canvas.width - image.width) // 2, (canvas.height - image.height) // 2),
+                            )
+                            image = canvas
+                        data = BytesIO()
+                        image.save(data, format="PNG", optimize=False)
+                        payload = data.getvalue()
             else:
                 reader = QImageReader(str(path))
                 source_size = reader.size()
                 if source_size.isValid() and source_size.width() > 0 and source_size.height() > 0:
-                    metadata = {
+                    metadata.update({
                         "image_size": (source_size.width(), source_size.height()),
                         "image_format": bytes(reader.format()).decode("ascii", errors="ignore").upper(),
-                    }
+                        "animated": bool(reader.supportsAnimation() and reader.imageCount() != 1),
+                        "frame_count": max(1, int(reader.imageCount() or 1)),
+                    })
                     max_width = max(1, int(self.max_size[0]))
                     max_height = max(1, int(self.max_size[1]))
                     scale = min(1.0, max_width / source_size.width(), max_height / source_size.height())
@@ -526,10 +1027,13 @@ class ImageDecodeTask(QRunnable):
                 if payload is not None:
                     raise StopIteration
                 with Image.open(path) as source:
-                    metadata = {
+                    frame_count = max(1, int(getattr(source, "n_frames", 1) or 1))
+                    metadata.update({
                         "image_size": (int(source.width), int(source.height)),
                         "image_format": str(source.format or path.suffix.upper().strip(".")),
-                    }
+                        "animated": bool(getattr(source, "is_animated", False) and frame_count > 1),
+                        "frame_count": frame_count,
+                    })
                     if getattr(source, "is_animated", False):
                         source.seek(0)
                     try:
@@ -573,14 +1077,27 @@ class AnimatedImageSignals(QObject):
 class AnimatedImageTask(QRunnable):
     """Decode and scale one animated image entirely outside the GUI thread."""
 
-    def __init__(self, generation, state_key, token, path, render_token, render_spec):
+    def __init__(
+        self,
+        generation,
+        state_key,
+        token,
+        path,
+        render_token,
+        render_spec,
+        playback_rate=1.0,
+        archive_source=None,
+    ):
         super().__init__()
         self.generation = int(generation)
         self.state_key = int(state_key)
         self.token = int(token)
         self.path = str(path)
+        self.archive_source = archive_source
         self._render_token = int(render_token)
         self._render_spec = dict(render_spec)
+        self._rate_token = 0
+        self._playback_rate = normalize_playback_rate(playback_rate) or 1.0
         self._spec_lock = threading.Lock()
         self.cancel_event = threading.Event()
         self.ack_event = threading.Event()
@@ -601,9 +1118,25 @@ class AnimatedImageTask(QRunnable):
             self._render_spec = dict(render_spec)
         self.refresh_event.set()
 
+    def set_playback_rate(self, playback_rate):
+        rate = normalize_playback_rate(playback_rate)
+        if rate is None:
+            return False
+        with self._spec_lock:
+            if math.isclose(rate, self._playback_rate, abs_tol=0.0005):
+                return True
+            self._playback_rate = rate
+            self._rate_token += 1
+        self.refresh_event.set()
+        return True
+
     def render_snapshot(self):
         with self._spec_lock:
             return self._render_token, dict(self._render_spec)
+
+    def rate_snapshot(self):
+        with self._spec_lock:
+            return self._rate_token, self._playback_rate
 
     @staticmethod
     def target_size(width, height, spec):
@@ -632,8 +1165,12 @@ class AnimatedImageTask(QRunnable):
             target_width = max(1, int(target_width * zoom))
             target_height = max(1, int(target_height * zoom))
         pixels = target_width * target_height
-        if pixels > MAX_ANIMATED_FRAME_PIXELS:
-            scale = (MAX_ANIMATED_FRAME_PIXELS / pixels) ** 0.5
+        max_frame_pixels = max(
+            1,
+            int(spec.get("max_frame_pixels", MAX_ANIMATED_FRAME_PIXELS)),
+        )
+        if pixels > max_frame_pixels:
+            scale = (max_frame_pixels / pixels) ** 0.5
             target_width = max(1, int(target_width * scale))
             target_height = max(1, int(target_height * scale))
         return target_width, target_height
@@ -643,13 +1180,25 @@ class AnimatedImageTask(QRunnable):
         delivered = 0
         try:
             QThread.currentThread().setPriority(QThread.LowPriority)
-            with Image.open(self.path) as reader:
+            source_bytes = (
+                self.archive_source.read(cancel_check=self.cancel_event.is_set)
+                if self.archive_source is not None
+                else None
+            )
+            source_handle = BytesIO(source_bytes) if source_bytes is not None else self.path
+            webp_durations = [] if source_bytes is not None else animated_webp_frame_durations(self.path)
+            with Image.open(source_handle) as reader:
                 frame_count = max(1, int(getattr(reader, "n_frames", 1) or 1))
                 animated = bool(getattr(reader, "is_animated", False) and frame_count > 1)
                 index = 0
                 while not self.cancel_event.is_set():
+                    _, cycle_rate = self.rate_snapshot()
+                    cycle_started = time.monotonic()
                     reader.seek(index)
-                    duration = max(20, int(reader.info.get("duration", 80) or 80))
+                    duration_value = int(reader.info.get("duration", 0) or 0)
+                    if duration_value <= 0 and index < len(webp_durations):
+                        duration_value = webp_durations[index]
+                    duration = max(10, duration_value or 80)
                     render_token, spec = self.render_snapshot()
                     frame = reader.convert("RGBA")
                     rotation = int(spec.get("rotation", 0)) % 360
@@ -678,11 +1227,30 @@ class AnimatedImageTask(QRunnable):
                         pass
                     if self.cancel_event.is_set() or not animated:
                         break
-                    refreshed = self.refresh_event.wait(duration / 1000.0)
-                    self.refresh_event.clear()
+                    source_remaining = max(
+                        0.0,
+                        float(duration) - (time.monotonic() - cycle_started) * 1000.0 * cycle_rate,
+                    )
+                    wait_render_token = render_token
+                    _, active_rate = self.rate_snapshot()
+                    rerender = False
+                    last_tick = time.monotonic()
+                    while source_remaining > 0 and not self.cancel_event.is_set():
+                        woke = self.refresh_event.wait(source_remaining / 1000.0 / active_rate)
+                        now = time.monotonic()
+                        source_remaining -= max(0.0, now - last_tick) * 1000.0 * active_rate
+                        last_tick = now
+                        if not woke:
+                            break
+                        self.refresh_event.clear()
+                        current_render_token, _ = self.render_snapshot()
+                        _, active_rate = self.rate_snapshot()
+                        if current_render_token != wait_render_token:
+                            rerender = True
+                            break
                     if self.cancel_event.is_set():
                         break
-                    if not refreshed:
+                    if not rerender:
                         index = (index + 1) % frame_count
         except Exception as exc:
             error = str(exc)
@@ -705,10 +1273,12 @@ class ArchiveSignals(QObject):
 
 
 class ArchiveExtractTask(QRunnable):
-    def __init__(self, archive_path, add_history=True):
+    def __init__(self, archive_path, add_history=True, navigation=None, request_id=0):
         super().__init__()
         self.archive_path = str(archive_path)
         self.add_history = bool(add_history)
+        self.navigation = dict(navigation) if navigation else None
+        self.request_id = int(request_id)
         self.signals = ArchiveSignals()
         self.cancelled = False
 
@@ -719,57 +1289,122 @@ class ArchiveExtractTask(QRunnable):
         result = {
             "archive": self.archive_path,
             "add_history": self.add_history,
+            "navigation": self.navigation,
+            "request_id": self.request_id,
             "tempdir": None,
             "root": None,
             "count": 0,
             "entries": [],
+            "snapshots": {},
+            "sources": {},
+            "session": None,
             "error": "",
             "cancelled": False,
         }
         tempdir = None
+        session = None
         try:
             tempdir = tempfile.TemporaryDirectory(prefix="pmv_zip_")
             root = Path(tempdir.name)
-            names = set()
-            with zipfile.ZipFile(self.archive_path) as archive:
-                for info in archive.infolist():
-                    if self.cancelled:
-                        raise InterruptedError
-                    if info.is_dir():
+            session = ArchiveSession(self.archive_path)
+            # Build a virtual directory tree.  Only directory placeholders
+            # are materialized; image bytes stay inside the ZIP and are read
+            # on demand through ArchiveMemberSource.
+            root_entries = []
+            snapshots = {}
+            used_names = {}
+
+            def safe_parts(member_name):
+                parts = []
+                for raw in PurePosixPath(str(member_name).replace("\\", "/")).parts:
+                    if raw in ("", ".", "/"):
                         continue
-                    inner = Path(info.filename)
-                    if inner.suffix.lower() not in IMAGE_EXTS:
+                    if raw == "..":
                         continue
-                    base_name = inner.name
-                    stem = Path(base_name).stem
-                    suffix = Path(base_name).suffix
-                    index = 1
-                    while base_name.lower() in names:
-                        base_name = f"{stem}_{index}{suffix}"
-                        index += 1
-                    names.add(base_name.lower())
-                    target = root / base_name
-                    with archive.open(info) as source, target.open("wb") as destination:
-                        while True:
-                            if self.cancelled:
-                                raise InterruptedError
-                            chunk = source.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            destination.write(chunk)
-                    stat = target.stat()
-                    result["entries"].append(
-                        MediaItem(target, False, size=int(stat.st_size), mtime=float(stat.st_mtime))
-                    )
-                    result["count"] += 1
+                    parts.append(raw)
+                return parts
+
+            def snapshot_for(folder):
+                key = str(folder)
+                if key not in snapshots:
+                    snapshots[key] = []
+                return snapshots[key]
+
+            def add_dir(parent, name, target):
+                entries = snapshot_for(parent)
+                if not any(item.is_dir and str(item.path) == str(target) for item in entries):
+                    entries.append(MediaItem(target, True, label=name))
+
+            infos = []
+            with session._lock:
+                if not session._closed:
+                    infos = list(session._archive.infolist())
+            for info in infos:
+                if self.cancelled:
+                    raise InterruptedError
+                parts = safe_parts(info.filename)
+                if not parts:
+                    continue
+                # Explicit directory records create the same folders as
+                # implicit parent paths; no file entry is added for them.
+                is_directory = bool(info.is_dir() or str(info.filename).endswith("/"))
+                if not is_directory and Path(parts[-1]).suffix.lower() not in MEDIA_EXTS:
+                    continue
+                parent = root
+                for part in parts[:-1]:
+                    child = parent / part
+                    child.mkdir(parents=False, exist_ok=True)
+                    add_dir(parent, part, child)
+                    parent = child
+                if is_directory:
+                    target = parent / parts[-1]
+                    target.mkdir(parents=False, exist_ok=True)
+                    add_dir(parent, parts[-1], target)
+                    snapshot_for(target)
+                    continue
+
+                original_name = parts[-1]
+                # ZIPs may contain duplicate names.  Keep the hierarchy and
+                # make only the conflicting virtual filename deterministic.
+                key = (str(parent), original_name.casefold())
+                duplicate_index = used_names.get(key, 0)
+                used_names[key] = duplicate_index + 1
+                display_name = original_name
+                if duplicate_index:
+                    stem = Path(original_name).stem
+                    suffix = Path(original_name).suffix
+                    display_name = f"{stem}_{duplicate_index}{suffix}"
+                target = parent / display_name
+                try:
+                    mtime = time.mktime(tuple(info.date_time) + (0, 0, -1))
+                except (OverflowError, ValueError):
+                    mtime = 0.0
+                item = MediaItem(
+                    target,
+                    False,
+                    label=original_name,
+                    size=int(info.file_size),
+                    mtime=float(mtime),
+                )
+                snapshot_for(parent).append(item)
+                result["sources"][str(target)] = ArchiveMemberSource(session, info.filename)
+                result["count"] += 1
+            root_entries = snapshot_for(root)
+            result["entries"] = root_entries
+            result["snapshots"] = snapshots
             result["tempdir"] = tempdir
             result["root"] = root
+            result["session"] = session
         except InterruptedError:
             result["cancelled"] = True
+            if session is not None:
+                session.close()
             if tempdir is not None:
                 tempdir.cleanup()
         except Exception as exc:
             result["error"] = str(exc)
+            if session is not None:
+                session.close()
             if tempdir is not None:
                 tempdir.cleanup()
         self.signals.finished.emit(result)
@@ -824,8 +1459,161 @@ class FolderScanTask(QRunnable):
         )
 
 
+class UncShareSignals(QObject):
+    finished = Signal(int, str, object, object)
+
+
+class UncShareTask(QRunnable):
+    """Run NetShareEnum away from the GUI thread."""
+
+    def __init__(self, generation, server):
+        super().__init__()
+        self.generation = int(generation)
+        self.server = str(server)
+        self.cancelled = False
+        self.signals = UncShareSignals()
+
+    def cancel(self):
+        self.cancelled = True
+
+    def run(self):
+        shares = []
+        error = ""
+        try:
+            if self.cancelled:
+                raise InterruptedError
+            QThread.currentThread().setPriority(QThread.LowPriority)
+            shares = unc_share_paths(self.server)
+        except InterruptedError:
+            return
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self.signals.finished.emit(
+                self.generation,
+                self.server,
+                shares,
+                {"error": error, "cancelled": self.cancelled},
+            )
+        except RuntimeError:
+            pass
+
+
+class FileOperationSignals(QObject):
+    finished = Signal(object)
+
+
+class FileOperationTask(QRunnable):
+    """Perform potentially slow shell/file operations off the GUI thread."""
+
+    def __init__(self, operation, **kwargs):
+        super().__init__()
+        self.operation = str(operation)
+        self.kwargs = kwargs
+        self.signals = FileOperationSignals()
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def run(self):
+        result = {"operation": self.operation, "copied": [], "errors": [], "cancelled": False}
+        if "target_folder" in self.kwargs:
+            result["target_folder"] = str(self.kwargs["target_folder"])
+        try:
+            if self.cancelled:
+                result["cancelled"] = True
+                return
+            if self.operation == "paste":
+                target_folder = Path(self.kwargs["target_folder"])
+                sources = [Path(path) for path in self.kwargs.get("sources", [])]
+                move_mode = bool(self.kwargs.get("move_mode"))
+                for source in sources:
+                    if self.cancelled:
+                        result["cancelled"] = True
+                        break
+                    if not source.exists():
+                        continue
+                    try:
+                        target = unique_copy_target(target_folder / source.name)
+                        if source.is_dir() and path_contains(source, target):
+                            raise ValueError(f"Cannot paste a folder into itself: {source}")
+                        if move_mode:
+                            shutil.move(str(source), str(target))
+                        elif source.is_dir():
+                            shutil.copytree(source, target)
+                        else:
+                            shutil.copy2(source, target)
+                        result["copied"].append(str(target))
+                    except Exception as exc:
+                        result["errors"].append(f"{source}\n{exc}")
+                        break
+            elif self.operation == "delete":
+                for source in self.kwargs.get("sources", []):
+                    if self.cancelled:
+                        result["cancelled"] = True
+                        break
+                    try:
+                        send_to_recycle_bin(Path(source))
+                    except Exception as exc:
+                        result["errors"].append(f"{source}\n{exc}")
+        except Exception as exc:
+            result["errors"].append(str(exc))
+        finally:
+            try:
+                self.signals.finished.emit(result)
+            except RuntimeError:
+                pass
+
+
 class VlcInitSignals(QObject):
     finished = Signal(object, object, str, object)
+
+
+class VideoCleanupSignals(QObject):
+    finished = Signal(object, object)
+
+
+class VideoStartSignals(QObject):
+    finished = Signal(object)
+
+
+class VideoPlayerCreateSignals(QObject):
+    finished = Signal(object, str, object)
+
+
+class VideoPlayerCreateTask:
+    def __init__(self, instance, count):
+        self.instance = instance
+        self.count = max(0, int(count))
+        self.signals = VideoPlayerCreateSignals()
+
+    def run(self):
+        bundles = []
+        error = ""
+        try:
+            if sys.platform == "win32":
+                try:
+                    ctypes.windll.kernel32.SetThreadPriority(
+                        ctypes.windll.kernel32.GetCurrentThread(), -1
+                    )
+                except Exception:
+                    pass
+            for _ in range(self.count):
+                player = self.instance.media_player_new()
+                if player is None:
+                    raise RuntimeError("libVLC media player creation returned no player")
+                bundles.append((self.instance, player))
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self.signals.finished.emit(bundles, error, self)
+        except RuntimeError:
+            for _instance, player in bundles:
+                try:
+                    player.release()
+                except Exception:
+                    pass
 
 
 class VlcInitTask(QRunnable):
@@ -843,9 +1631,9 @@ class VlcInitTask(QRunnable):
         self.signals = VlcInitSignals()
 
     def run(self):
-        instance = None
-        player = None
+        bundles = []
         error = ""
+        instance = None
         try:
             if sys.platform == "win32":
                 try:
@@ -854,16 +1642,21 @@ class VlcInitTask(QRunnable):
                     )
                 except Exception:
                     pass
-            instance = self.vlc_module.Instance("--quiet")
+            instance = self.vlc_module.Instance(*VLC_INSTANCE_ARGS)
             if instance is None:
                 raise RuntimeError("libVLC instance creation returned no instance")
-            player = instance.media_player_new()
-            if player is None:
-                raise RuntimeError("libVLC media player creation returned no player")
+            # Return one usable player as soon as the cold libVLC instance is
+            # ready.  Filling the transition pool here made the first video
+            # wait for every standby player even though it only needs one.
+            for _ in range(VIDEO_INITIAL_PLAYER_TARGET):
+                player = instance.media_player_new()
+                if player is None:
+                    raise RuntimeError("libVLC media player creation returned no player")
+                bundles.append((instance, player))
         except Exception as exc:
             error = str(exc)
             try:
-                if player is not None:
+                for instance, player in bundles:
                     player.release()
             except Exception:
                 pass
@@ -872,12 +1665,71 @@ class VlcInitTask(QRunnable):
                     instance.release()
             except Exception:
                 pass
-            instance = None
-            player = None
+            bundles = []
         try:
-            self.signals.finished.emit(instance, player, error, self)
+            sentinel = bundles[0][0] if bundles else None
+            self.signals.finished.emit(sentinel, bundles, error, self)
         except RuntimeError:
             pass
+
+
+class ExtensionBadgeDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        view = option.widget
+        if not isinstance(view, QListWidget) or view.viewMode() != QListWidget.IconMode:
+            return
+        path = str(index.data(Qt.UserRole) or "")
+        label = extension_badge_text(path)
+        background = type_badge_color(path)
+        if not label or background is None:
+            return
+
+        badge_option = QStyleOptionViewItem(option)
+        self.initStyleOption(badge_option, index)
+        icon_rect = view.style().subElementRect(QStyle.SE_ItemViewItemDecoration, badge_option, view)
+        if not icon_rect.isValid() or icon_rect.width() < 12 or icon_rect.height() < 12:
+            icon_size = view.iconSize()
+            icon_width = min(icon_size.width(), max(1, option.rect.width() - 8))
+            icon_height = min(icon_size.height(), max(1, option.rect.height() - 24))
+            icon_rect = QRect(
+                option.rect.center().x() - icon_width // 2,
+                option.rect.top() + 4,
+                icon_width,
+                icon_height,
+            )
+
+        short_side = min(icon_rect.width(), icon_rect.height())
+        pixel_size = max(8, min(14, round(short_side * 0.11)))
+        font = QFont(option.font)
+        font.setBold(True)
+        font.setPixelSize(pixel_size)
+        metrics = QFontMetrics(font)
+        horizontal_padding = max(4, pixel_size // 2)
+        vertical_padding = max(2, pixel_size // 6)
+        badge_width = metrics.horizontalAdvance(label) + horizontal_padding * 2
+        badge_height = metrics.height() + vertical_padding * 2
+        margin = max(2, round(short_side * 0.025))
+        badge_rect = QRect(
+            icon_rect.right() - badge_width - margin + 1,
+            icon_rect.bottom() - badge_height - margin + 1,
+            badge_width,
+            badge_height,
+        )
+        radius = max(3, badge_height // 3)
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 90))
+        painter.drawRoundedRect(badge_rect.translated(0, 1), radius, radius)
+        painter.setPen(QPen(QColor(255, 255, 255, 115), 1))
+        painter.setBrush(background)
+        painter.drawRoundedRect(badge_rect, radius, radius)
+        painter.setPen(contrasting_text_color(background))
+        painter.setFont(font)
+        painter.drawText(badge_rect, Qt.AlignCenter, label)
+        painter.restore()
 
 
 class ThumbList(QListWidget):
@@ -890,6 +1742,7 @@ class ThumbList(QListWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("thumbList")
+        self._dark_theme = True
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.MoveAction)
@@ -897,34 +1750,58 @@ class ThumbList(QListWidget):
         self.itemDoubleClicked.connect(self._open_item)
         self.itemSelectionChanged.connect(self._preview_selected)
         self.icon_provider = QFileIconProvider()
+        self.setItemDelegate(ExtensionBadgeDelegate(self))
         self.setSpacing(8)
 
     def set_view_mode_name(self, mode):
+        previously_showed_row_colors = self.viewMode() == QListWidget.ListMode
         if mode == "list":
             self.setViewMode(QListWidget.ListMode)
+            self.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
             self.setIconSize(QSize(32, 32))
             self.setGridSize(QSize())
             self.setResizeMode(QListWidget.Adjust)
         elif mode == "details":
             self.setViewMode(QListWidget.ListMode)
+            self.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
             self.setIconSize(QSize(48, 48))
             self.setGridSize(QSize())
             self.setResizeMode(QListWidget.Adjust)
         elif mode == "small":
             self.setViewMode(QListWidget.IconMode)
+            self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
             self.setIconSize(QSize(72, 72))
             self.setGridSize(QSize(116, 116))
             self.setResizeMode(QListWidget.Adjust)
         elif mode == "medium":
             self.setViewMode(QListWidget.IconMode)
+            self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
             self.setIconSize(QSize(120, 120))
             self.setGridSize(QSize(168, 160))
             self.setResizeMode(QListWidget.Adjust)
         else:
             self.setViewMode(QListWidget.IconMode)
+            self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
             self.setIconSize(QSize(168, 168))
             self.setGridSize(QSize(224, 216))
             self.setResizeMode(QListWidget.Adjust)
+        if previously_showed_row_colors != (self.viewMode() == QListWidget.ListMode):
+            self.refresh_type_colors()
+
+    def set_dark_theme(self, dark_theme):
+        self._dark_theme = bool(dark_theme)
+        self.refresh_type_colors()
+        self.viewport().update()
+
+    def refresh_type_colors(self):
+        show_row_colors = self.viewMode() == QListWidget.ListMode
+        for row in range(self.count()):
+            item = self.item(row)
+            path = str(item.data(Qt.UserRole) or "")
+            item.setData(
+                Qt.BackgroundRole,
+                type_color(path, dark_theme=self._dark_theme) if show_row_colors else None,
+            )
 
     def _open_item(self, item):
         self.openRequested.emit(item.data(Qt.UserRole))
@@ -936,6 +1813,24 @@ class ThumbList(QListWidget):
 
     def startDrag(self, supported_actions):
         super().startDrag(supported_actions)
+
+    def wheelEvent(self, event):
+        if self.viewMode() != QListWidget.IconMode or event.modifiers() != Qt.NoModifier:
+            super().wheelEvent(event)
+            return
+        angle_delta = event.angleDelta().y()
+        pixel_delta = event.pixelDelta().y()
+        if angle_delta:
+            row_height = max(1, self.gridSize().height())
+            distance = round(-angle_delta / 120.0 * row_height * THUMBNAIL_WHEEL_ROWS)
+        elif pixel_delta:
+            distance = round(-pixel_delta * THUMBNAIL_TOUCHPAD_SCALE)
+        else:
+            super().wheelEvent(event)
+            return
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value() + distance)
+        event.accept()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Home:
@@ -1012,6 +1907,7 @@ class DetailsTable(QTableWidget):
         self._make_icon = None
         self._lightweight_load = True
         self._row_ready_callback = None
+        self._dark_theme = True
         self.setHorizontalHeaderLabels(self.HEADERS)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -1074,7 +1970,7 @@ class DetailsTable(QTableWidget):
                 item.setData(Qt.UserRole, str(entry.path))
                 item.setData(Qt.UserRole + 2, 0 if entry.is_dir else 1)
                 sort_values = [
-                    entry.display_name.lower(),
+                    natural_sort_key(entry.display_name),
                     entry.size,
                     entry.kind,
                     entry.mtime,
@@ -1085,7 +1981,7 @@ class DetailsTable(QTableWidget):
                     item.setIcon(self._make_icon(entry))
                 if col == 1:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                color = type_color(entry.path, entry.is_dir)
+                color = type_color(entry.path, entry.is_dir, dark_theme=self._dark_theme)
                 if color is not None:
                     item.setBackground(color)
                 self.setItem(row, col, item)
@@ -1179,7 +2075,9 @@ class PreviewPanel(QLabel):
         self._current_path = None
         self._decoded_pixel_size = QSize()
         self._generation = 0
+        self._suspended = False
         self._task_refs = set()
+        self.source_resolver = None
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
         self._resize_decode_timer = QTimer(self)
@@ -1196,12 +2094,25 @@ class PreviewPanel(QLabel):
     def show_path(self, path):
         self._generation += 1
         generation = self._generation
+        for task in list(self._task_refs):
+            try:
+                task.cancel()
+            except Exception:
+                pass
         self._pool.clear()
+        if self.movie is not None:
+            try:
+                self.movie.stop()
+            except RuntimeError:
+                pass
         self.movie = None
         self._source_pixmap = QPixmap()
         self._decoded_pixel_size = QSize()
         self._current_path = str(path) if path else None
-        if not path or not Path(path).exists():
+        if self._suspended:
+            return
+        archive_source = self.source_resolver(str(path)) if path and self.source_resolver else None
+        if not path or (not Path(path).exists() and archive_source is None):
             self.setText("Preview")
             self.setPixmap(QPixmap())
             return
@@ -1209,7 +2120,7 @@ class PreviewPanel(QLabel):
             self.setText("Video\n" + file_label(path))
             self.setPixmap(self.style().standardIcon(QStyle.SP_MediaPlay).pixmap(96, 96))
             return
-        if Path(path).suffix.lower() == ".gif":
+        if archive_source is None and Path(path).suffix.lower() == ".gif":
             movie = QMovie(path)
             if movie.isValid():
                 self.movie = movie
@@ -1218,7 +2129,33 @@ class PreviewPanel(QLabel):
                 return
         self.setText("Loading…")
         self.setPixmap(QPixmap())
-        self._queue_decode(generation, str(path))
+        self._queue_decode(generation, str(path), archive_source=archive_source)
+
+    def suspend(self):
+        self._suspended = True
+        self._generation += 1
+        self._resize_decode_timer.stop()
+        for task in list(self._task_refs):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        self._pool.clear()
+        if self.movie is not None:
+            try:
+                self.movie.stop()
+            except RuntimeError:
+                pass
+        self.setPixmap(QPixmap())
+        self.movie = None
+
+    def resume(self):
+        if not self._suspended:
+            return
+        self._suspended = False
+        path = self._current_path
+        if path:
+            self.show_path(path)
 
     def _decode_target(self):
         dpr = max(1.0, float(self.devicePixelRatioF()))
@@ -1228,9 +2165,14 @@ class PreviewPanel(QLabel):
         scale = min(1.0, 2048.0 / max(width, height))
         return QSize(max(1, int(width * scale)), max(1, int(height * scale)))
 
-    def _queue_decode(self, generation, path):
+    def _queue_decode(self, generation, path, archive_source=None):
         target = self._decode_target()
-        task = ImageDecodeTask(generation, path, (target.width(), target.height()))
+        task = ImageDecodeTask(
+            generation,
+            path,
+            (target.width(), target.height()),
+            archive_source=archive_source,
+        )
         self._task_refs.add(task)
         task.signals.finished.connect(
             lambda result_generation, result_path, payload, metadata, ref=task: self._preview_ready(
@@ -1241,7 +2183,13 @@ class PreviewPanel(QLabel):
 
     def _reload_for_current_size(self):
         path = self._current_path
-        if not path or not Path(path).exists() or is_video(path) or Path(path).suffix.lower() == ".gif":
+        archive_source = self.source_resolver(str(path)) if path and self.source_resolver else None
+        if (
+            not path
+            or (not Path(path).exists() and archive_source is None)
+            or is_video(path)
+            or (archive_source is None and Path(path).suffix.lower() == ".gif")
+        ):
             return
         target = self._decode_target()
         if (
@@ -1253,7 +2201,7 @@ class PreviewPanel(QLabel):
         self._generation += 1
         self._pool.clear()
         self.setText("Loading…")
-        self._queue_decode(self._generation, path)
+        self._queue_decode(self._generation, path, archive_source=archive_source)
 
     def _preview_ready(self, generation, path, payload, task):
         self._task_refs.discard(task)
@@ -1537,6 +2485,13 @@ class ViewerMouseWheelHook:
         self.user32.UnhookWindowsHookEx.restype = wintypes.BOOL
         self.kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
         self.kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        self.user32.GetForegroundWindow.argtypes = []
+        self.user32.GetForegroundWindow.restype = wintypes.HWND
+        self.user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self.user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
     def install(self):
         if self.hook:
@@ -1552,12 +2507,36 @@ class ViewerMouseWheelHook:
     def _callback(self, code, wparam, lparam):
         if code == self.HC_ACTION and int(wparam) == self.WM_MOUSEWHEEL:
             viewer = getattr(self.main_window, "viewer", None)
-            if viewer and viewer.is_active_viewer() and self._point_in_window(lparam):
+            # WH_MOUSE_LL receives wheel messages for every process.  Only
+            # consume them when this viewer's process is the foreground
+            # process; otherwise a window placed in front (e.g. Explorer)
+            # would still rotate the hidden viewer behind it.
+            if (
+                viewer
+                and viewer.is_active_viewer()
+                and self._viewer_process_is_foreground()
+                and self._point_in_window(lparam)
+            ):
                 info = self.MSLLHOOKSTRUCT.from_address(int(lparam))
                 delta = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
                 QTimer.singleShot(0, lambda d=delta: viewer.handle_wheel_delta(d))
                 return 1
         return self.user32.CallNextHookEx(self.hook, code, wparam, lparam)
+
+    def _viewer_process_is_foreground(self):
+        try:
+            foreground = int(self.user32.GetForegroundWindow() or 0)
+            if not foreground:
+                return False
+            process_id = wintypes.DWORD()
+            if not self.user32.GetWindowThreadProcessId(
+                foreground,
+                ctypes.byref(process_id),
+            ):
+                return False
+            return int(process_id.value) == os.getpid()
+        except Exception:
+            return False
 
     def _point_in_window(self, lparam):
         info = self.MSLLHOOKSTRUCT.from_address(int(lparam))
@@ -1574,12 +2553,17 @@ class ViewerWindow(QMainWindow):
     pasteRequested = Signal()
     propertiesRequested = Signal(str)
     videoEnded = Signal(int)
+    videoOutputReady = Signal(int, int)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self.performance_policy = performance_policy_for(settings)
+        self.app_closing = False
         self.items = []
         self.item_signatures = {}
+        self.archive_sources = {}
+        self.archive_image_sizes = {}
         self.index = 0
         self.zoom_factor = 1.0
         self.fit_mode = settings.get("default_fit", "fit_height")
@@ -1600,21 +2584,63 @@ class ViewerWindow(QMainWindow):
         self.vlc_init_thread = None
         self.vlc_init_inflight = False
         self.vlc_init_error = ""
+        self.video_player_create_task_refs = set()
+        self.video_player_create_thread = None
+        self.video_player_create_inflight = False
         self.pending_video_requests = []
+        self.pending_navigation_index = None
+        self.pending_render_requested = False
+        self.pending_render_reset = False
         self.video_playback_token = 0
         self._video_end_callback = None
         self.video_slot_states = {}
         self.video_end_callbacks = {}
+        self.video_ready_callbacks = {}
         self.video_loop_enabled = bool(settings.get("video_loop_enabled", False))
+        self.playback_rate = 1.0
+        self.current_has_animation = False
         self.video_cleanup_queue = queue.Queue()
         self.video_cleanup_closed = False
+        self.video_cleanup_signals = VideoCleanupSignals()
+        self.video_cleanup_signals.accept_results = True
+        self.video_cleanup_signals.finished.connect(
+            self._video_cleanup_finished,
+            Qt.QueuedConnection,
+        )
+        self.video_player_frames = {}
+        self.video_player_instances = {}
+        self.video_retired_callback_refs = {}
+        self.video_frame_busy = set()
+        self.video_retired_players = []
+        self.video_cleanup_flush_pending = False
+        self.video_cleanup_inflight = 0
         self.video_cleanup_thread = threading.Thread(
             target=self._video_cleanup_worker,
-            args=(self.video_cleanup_queue,),
+            args=(self.video_cleanup_queue, self.video_cleanup_signals),
             name="PhotoViewer-VLC-Cleanup",
             daemon=True,
         )
         self.video_cleanup_thread.start()
+        self.video_start_queue = queue.Queue()
+        self.video_start_closed = False
+        self.video_start_inflight = 0
+        self.video_start_players = {}
+        self.video_start_started = {}
+        self.video_player_locks = {}
+        self.video_retired_instances = []
+        self.video_start_signals = VideoStartSignals()
+        self.video_start_signals.accept_results = True
+        self.video_start_signals.finished.connect(
+            self._video_start_finished,
+            Qt.QueuedConnection,
+        )
+        self.video_start_thread = threading.Thread(
+            target=self._video_start_worker,
+            args=(self.video_start_queue, self.video_start_signals),
+            name="PhotoViewer-VLC-Start",
+            daemon=True,
+        )
+        self.video_start_thread.start()
         self.movie = None
         self._app_filter_installed = False
         self._seeking_video = False
@@ -1624,6 +2650,8 @@ class ViewerWindow(QMainWindow):
         self.webtoon_scroll = None
         self.webtoon_container = None
         self.webtoon_loaded = set()
+        self.webtoon_label_indices = {}
+        self.webtoon_label_tops = []
         self.webtoon_idle_index = 0
         self.webtoon_target_width = None
         self.webtoon_pixmap_cache = {}
@@ -1643,12 +2671,8 @@ class ViewerWindow(QMainWindow):
         self.viewer_pixmap_cache = {}
         self.viewer_pixmap_cache_order = []
         self.viewer_pixmap_cache_bytes = 0
-        viewer_profile = PERFORMANCE_PROFILES.get(
-            settings.get("performance_profile", "balanced"),
-            PERFORMANCE_PROFILES["balanced"],
-        )
         self.decode_pool = QThreadPool(self)
-        self.decode_pool.setMaxThreadCount(max(1, int(viewer_profile["thumbnail_workers"])))
+        self.decode_pool.setMaxThreadCount(max(1, int(self.performance_policy.viewer_decode_workers)))
         self.decode_pool.setThreadPriority(QThread.LowPriority)
         self.preload_decode_pool = QThreadPool(self)
         self.preload_decode_pool.setMaxThreadCount(1)
@@ -1668,17 +2692,19 @@ class ViewerWindow(QMainWindow):
         self.animated_image_path = None
         self.animated_image_states = {}
         self.animated_image_pool = QThreadPool(self)
-        self.animated_image_pool.setMaxThreadCount(3)
+        self.animated_image_pool.setMaxThreadCount(max(1, int(self.performance_policy.animation_workers)))
         self.animated_image_pool.setThreadPriority(QThread.LowPriority)
         self.animated_image_task_refs = set()
         self.animated_image_token = 0
         self.animated_render_token = 0
+        self.animated_image_classifications = {}
 
         self.setWindowTitle(APP_NAME + " - Viewer")
         self.setMinimumSize(900, 640)
         self._build_ui()
         self._build_shortcuts()
         self.videoEnded.connect(self._mark_video_ended, Qt.QueuedConnection)
+        self.videoOutputReady.connect(self._mark_video_output_ready, Qt.QueuedConnection)
 
     def _build_ui(self):
         self.setStyleSheet("QMainWindow { background: #050505; }")
@@ -1700,15 +2726,21 @@ class ViewerWindow(QMainWindow):
         self.grid.setSpacing(0)
         self.setCentralWidget(self.central)
         self.labels = []
-        self.video_frame = QFrame()
+        self.video_frame = QFrame(self.central)
         self.video_frame.setObjectName("videoFrame")
         self.video_frame.setAttribute(Qt.WA_StyledBackground, True)
         self.video_frame.setStyleSheet("background: #000;")
         self.video_frame.setAutoFillBackground(True)
         self.video_frame.setFocusPolicy(Qt.StrongFocus)
         self.video_frame.setMouseTracking(True)
+        self.video_frame.setAttribute(Qt.WA_NativeWindow, True)
+        self.video_frame.setProperty("videoPoolSlot", 0)
         self.central.setFocusPolicy(Qt.StrongFocus)
         self.video_frame.installEventFilter(self)
+        # Keep the HWND alive until its libVLC player has been released.  VLC
+        # may otherwise create a visible fallback Direct3D top-level window.
+        self.video_frames = [self.video_frame]
+        self.video_frame_pools = {0: [self.video_frame]}
         self.central.installEventFilter(self)
         self.delete_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), self)
         self.delete_shortcut.setContext(Qt.ApplicationShortcut)
@@ -1722,6 +2754,7 @@ class ViewerWindow(QMainWindow):
         self.viewer_overlay.setObjectName("viewerOverlay")
         self.viewer_overlay.setStyleSheet("""
             #viewerOverlay { background: rgba(28,25,36,235); border: 1px solid rgba(151,126,218,145); border-radius: 10px; color: white; }
+            #viewerOverlay QLabel { background: transparent; color: #f5f1fc; }
             QPushButton, QComboBox, QToolButton, QLineEdit { background: #302c3b; color: #f5f1fc; border: 1px solid #4b445d; border-radius: 7px; padding: 4px 9px; }
             QPushButton:hover, QComboBox:hover, QToolButton:hover { background: #3b3549; border-color: #927bd8; }
             QPushButton:checked { background: #927bd8; border-color: #ad99e8; color: white; font-weight: 700; }
@@ -1740,6 +2773,16 @@ class ViewerWindow(QMainWindow):
         self.fit_combo = QComboBox()
         self.fit_combo.addItems(["manual", "actual", "fit_height", "fit_width", "fit_window"])
         self.fit_combo.setCurrentText(self.fit_mode)
+        popup_palette = self.fit_combo.view().palette()
+        popup_palette.setColor(QPalette.Window, QColor("#211e29"))
+        popup_palette.setColor(QPalette.Base, QColor("#211e29"))
+        popup_palette.setColor(QPalette.Text, QColor("#f5f1fc"))
+        popup_palette.setColor(QPalette.Highlight, QColor("#7560b4"))
+        popup_palette.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+        self.fit_combo.view().setPalette(popup_palette)
+        self.fit_combo.view().viewport().setPalette(popup_palette)
+        self.fit_combo.view().setStyleSheet(VIEWER_COMBO_POPUP_STYLE)
+        self.fit_combo.view().viewport().setAutoFillBackground(True)
         self.fit_combo.currentTextChanged.connect(self.set_fit_mode)
         overlay_layout.addWidget(QLabel("Fit"))
         overlay_layout.addWidget(self.fit_combo)
@@ -1765,19 +2808,14 @@ class ViewerWindow(QMainWindow):
         self.update_manual_zoom_controls()
         self.viewer_overlay.hide()
 
-        self.corner_filename_label = QLabel("", self.central)
-        self.corner_filename_label.setObjectName("cornerFilenameLabel")
-        self.corner_filename_label.setStyleSheet("""
-            #cornerFilenameLabel { background: rgba(28,25,36,225); color: white; border: 1px solid rgba(151,126,218,130); border-radius: 8px; padding: 6px 10px; }
-        """)
-        self.corner_filename_label.hide()
-
         self.rotation_overlay = QFrame(self.central)
         self.rotation_overlay.setObjectName("rotationOverlay")
         self.rotation_overlay.setStyleSheet("""
             #rotationOverlay { background: rgba(28,25,36,235); border: 1px solid rgba(151,126,218,145); border-radius: 10px; color: white; }
+            #rotationOverlay QLabel { background: transparent; color: #f5f1fc; }
             QPushButton { background: #302c3b; color: #f5f1fc; border: 1px solid #4b445d; border-radius: 7px; padding: 4px 11px; }
             QPushButton:hover { background: #3b3549; border-color: #927bd8; }
+            QPushButton::menu-indicator { image: none; width: 0px; }
         """)
         rotate_layout = QHBoxLayout(self.rotation_overlay)
         rotate_layout.setContentsMargins(8, 6, 8, 6)
@@ -1797,16 +2835,23 @@ class ViewerWindow(QMainWindow):
         rotate_layout.addWidget(self.rotate_left_btn)
         rotate_layout.addWidget(self.rotate_reset_btn)
         rotate_layout.addWidget(self.rotate_right_btn)
+        self.animated_rate_btn = self.create_playback_rate_button("animatedRateButton")
+        self.animated_rate_btn.setToolTip("Animated image playback speed")
+        self.animated_rate_btn.setAccessibleName("Animated image playback speed")
+        self.animated_rate_btn.hide()
+        rotate_layout.addWidget(self.animated_rate_btn)
         self.rotation_overlay.hide()
 
         self.video_overlay = QFrame(self.central)
         self.video_overlay.setObjectName("videoOverlay")
         self.video_overlay.setStyleSheet("""
             #videoOverlay { background: rgba(28,25,36,238); border: 1px solid rgba(151,126,218,150); border-radius: 10px; color: white; }
+            #videoOverlay QLabel { background: transparent; color: #f5f1fc; }
             QPushButton { background: #302c3b; color: #f5f1fc; border: 1px solid #4b445d; border-radius: 7px; padding: 4px 9px; }
             QPushButton:hover { background: #3b3549; border-color: #927bd8; }
             QPushButton:checked { background: #927bd8; border-color: #ad99e8; color: white; font-weight: 700; }
             QPushButton#videoLoopButton { padding: 0; font-size: 15px; font-weight: 700; }
+            QPushButton::menu-indicator { image: none; width: 0px; }
             QSlider::groove:horizontal { height: 5px; background: #4b4559; border-radius: 2px; }
             QSlider::handle:horizontal { width: 12px; margin: -5px 0; border-radius: 6px; background: #a991e8; }
         """)
@@ -1819,6 +2864,9 @@ class ViewerWindow(QMainWindow):
         self.play_btn.clicked.connect(self.toggle_play)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.stop_media)
+        self.video_rate_btn = self.create_playback_rate_button("videoRateButton")
+        self.video_rate_btn.setToolTip("Video playback speed")
+        self.video_rate_btn.setAccessibleName("Video playback speed")
         self.video_loop_btn = QPushButton("∞")
         self.video_loop_btn.setObjectName("videoLoopButton")
         self.video_loop_btn.setCheckable(True)
@@ -1841,6 +2889,7 @@ class ViewerWindow(QMainWindow):
         video_layout.addWidget(self.video_filename_label)
         video_layout.addWidget(self.play_btn)
         video_layout.addWidget(self.stop_btn)
+        video_layout.addWidget(self.video_rate_btn)
         video_layout.addWidget(self.video_loop_btn)
         video_layout.addWidget(self.time_label)
         video_layout.addWidget(self.seek_slider, 1)
@@ -1893,6 +2942,25 @@ class ViewerWindow(QMainWindow):
 
         self.video_timer = QTimer(self)
         self.video_timer.timeout.connect(self.update_video_controls)
+        self.video_ready_timer = QTimer(self)
+        self.video_ready_timer.setInterval(30)
+        self.video_ready_timer.timeout.connect(self.poll_video_output_ready)
+        # A single coalescing timer prevents a resize/zoom gesture from
+        # launching two full image decodes for every intermediate geometry.
+        self.image_update_timer = QTimer(self)
+        self.image_update_timer.setSingleShot(True)
+        self.image_update_timer.setInterval(60)
+        self.image_update_timer.timeout.connect(self._apply_scheduled_image_update)
+        self.image_update_pending_generation = None
+        self.image_update_token = 0
+        self.video_cleanup_idle_timer = QTimer(self)
+        self.video_cleanup_idle_timer.setSingleShot(True)
+        self.video_cleanup_idle_timer.setInterval(VIDEO_CLEANUP_IDLE_MS)
+        self.video_cleanup_idle_timer.timeout.connect(self._flush_deferred_video_cleanup)
+        self.vlc_prewarm_timer = QTimer(self)
+        self.vlc_prewarm_timer.setSingleShot(True)
+        self.vlc_prewarm_timer.setInterval(450)
+        self.vlc_prewarm_timer.timeout.connect(self._init_vlc_async)
         self.animated_image_timer = QTimer(self)
         self.animated_image_timer.timeout.connect(self.advance_animated_image)
         self.webtoon_idle_timer = QTimer(self)
@@ -1916,14 +2984,110 @@ class ViewerWindow(QMainWindow):
         self.input_layer = QWidget(self.central)
         self.input_layer.setObjectName("viewerInputLayer")
         self.input_layer.setMouseTracking(True)
-        self.input_layer.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.input_layer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.input_layer.setStyleSheet("background: transparent;")
         self.input_layer.installEventFilter(self)
-        self.input_layer.raise_()
+        self.input_layer.hide()
         self.update_webtoon_auto_scroll_controls()
+
+    def apply_performance_policy(self, policy=None):
+        """Refresh worker limits after the existing settings dialog saves."""
+        self.performance_policy = policy or performance_policy_for(self.settings)
+        if hasattr(self, "decode_pool"):
+            self.decode_pool.setMaxThreadCount(max(1, int(self.performance_policy.viewer_decode_workers)))
+        if hasattr(self, "animated_image_pool"):
+            self.animated_image_pool.setMaxThreadCount(max(1, int(self.performance_policy.animation_workers)))
+
+    def create_playback_rate_button(self, object_name):
+        button = QPushButton(format_playback_rate(self.playback_rate))
+        button.setObjectName(object_name)
+        button.setFixedSize(58, 28)
+        menu = QMenu(button)
+        menu.setObjectName("playbackRateMenu")
+        menu.setStyleSheet("""
+            QMenu#playbackRateMenu { background: #211e29; color: #f5f1fc; border: 1px solid #5d5275; border-radius: 7px; padding: 5px; }
+            QMenu#playbackRateMenu::item { min-width: 76px; padding: 6px 12px; border-radius: 5px; }
+            QMenu#playbackRateMenu::item:selected { background: #7560b4; color: white; }
+            QMenu#playbackRateMenu::item:checked { background: #927bd8; color: white; }
+            QLineEdit { min-width: 82px; background: #302c3b; color: #f5f1fc; border: 1px solid #5d5275; border-radius: 5px; padding: 5px 7px; }
+        """)
+        custom_edit = QLineEdit(menu)
+        custom_edit.setPlaceholderText("Input...")
+        custom_edit.setToolTip(f"{PLAYBACK_RATE_MIN:g}x - {PLAYBACK_RATE_MAX:g}x")
+        input_action = QWidgetAction(menu)
+        input_action.setDefaultWidget(custom_edit)
+        menu.addAction(input_action)
+        menu.addSeparator()
+        rate_actions = {}
+        for rate in PLAYBACK_RATE_PRESETS:
+            action = menu.addAction(format_playback_rate(rate))
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked=False, value=rate: self.set_playback_rate(value))
+            rate_actions[rate] = action
+        custom_edit.returnPressed.connect(
+            lambda edit=custom_edit, popup=menu: self.apply_custom_playback_rate(edit, popup)
+        )
+        menu.aboutToShow.connect(lambda edit=custom_edit: self.prepare_playback_rate_input(edit))
+        button.setMenu(menu)
+        button.playback_rate_menu = menu
+        button.playback_rate_edit = custom_edit
+        button.playback_rate_actions = rate_actions
+        return button
+
+    def prepare_playback_rate_input(self, edit):
+        edit.setText("")
+        edit.setStyleSheet("")
+
+    def apply_custom_playback_rate(self, edit, menu):
+        if self.set_playback_rate(edit.text()):
+            edit.setStyleSheet("")
+            menu.close()
+            return
+        edit.setStyleSheet("border: 1px solid #d56f7b;")
+        edit.selectAll()
+
+    def sync_playback_rate_controls(self):
+        label = format_playback_rate(self.playback_rate)
+        for button_name in ("video_rate_btn", "animated_rate_btn"):
+            button = getattr(self, button_name, None)
+            if button is None:
+                continue
+            button.setText(label)
+            for rate, action in getattr(button, "playback_rate_actions", {}).items():
+                action.setChecked(math.isclose(rate, self.playback_rate, abs_tol=0.0005))
+
+    def set_playback_rate(self, value):
+        rate = normalize_playback_rate(value)
+        if rate is None:
+            return False
+        self.playback_rate = rate
+        self.sync_playback_rate_controls()
+        for state in list(self.animated_image_states.values()):
+            task = state.get("task")
+            if task is not None:
+                task.set_playback_rate(rate)
+        players = [self.media_player, *self.extra_media_players]
+        players.extend(state.get("player") for state in self.video_slot_states.values())
+        seen = set()
+        for player in players:
+            if player is None or id(player) in seen:
+                continue
+            seen.add(id(player))
+            self.apply_video_playback_rate(player)
+        return True
+
+    def apply_video_playback_rate(self, player):
+        if player is None:
+            return False
+        try:
+            result = player.set_rate(float(self.playback_rate))
+            return result is None or int(result) == 0
+        except Exception:
+            return False
 
     def build_mode_menu(self):
         menu = QMenu(self.mode_btn)
+        menu.setStyleSheet(VIEWER_POPUP_MENU_STYLE)
         menu.addAction("single", lambda: self.set_viewer_mode("single"))
         double_menu = menu.addMenu("double")
         double_menu.addAction("1,2 / 3,4", lambda: self.set_viewer_mode("double", "page"))
@@ -2104,6 +3268,10 @@ class ViewerWindow(QMainWindow):
         }
         for action, callback in mapping.items():
             for seq in self.settings.get("shortcuts", {}).get(action, []):
+                if action in ("zoom_in", "zoom_out") and seq.strip() in ("+", "-"):
+                    # Plain +/- are handled from the actual key event below so
+                    # the main keyboard row and numeric keypad behave equally.
+                    continue
                 if action == "toggle_play" and seq == "Space":
                     continue
                 if seq.startswith("Mouse") or seq.startswith("Wheel"):
@@ -2141,14 +3309,42 @@ class ViewerWindow(QMainWindow):
             player.video_set_key_input(False)
         except Exception:
             pass
+        # A libVLC player can retain vout geometry overrides across media.
+        # Always start a new slot from VLC's native automatic layout, then
+        # apply the selected viewer fit mode after the vout reports its source
+        # size.  Resetting aspect/crop here is especially important for mixed
+        # SAR, rotated, MP4 and MKV sequences.
+        for method_name, value in (
+            ("video_set_scale", 0.0),
+            ("video_set_aspect_ratio", None),
+            ("video_set_crop_geometry", None),
+        ):
+            try:
+                getattr(player, method_name)(value)
+            except Exception:
+                pass
 
-    def _vlc_init_finished(self, instance, player, error, task):
+    def _vlc_init_finished(self, instance, bundles, error, task):
         self.vlc_init_task_refs.discard(task)
         self.vlc_init_inflight = False
         self.vlc_init_error = error or ""
+        if self.app_closing:
+            for _player_instance, player in list(bundles or []):
+                try:
+                    player.release()
+                except Exception:
+                    pass
+            try:
+                if instance is not None:
+                    instance.release()
+            except Exception:
+                pass
+            return
         pending = list(self.pending_video_requests)
         self.pending_video_requests = []
-        if instance is None or player is None:
+        bundles = list(bundles or [])
+        players = [player for _player_instance, player in bundles]
+        if instance is None or not players:
             self.vlc_instance = None
             self.media_player = None
             for request in pending:
@@ -2160,13 +3356,83 @@ class ViewerWindow(QMainWindow):
             return
         self.vlc_instance = instance
         self.media_player = None
-        self._configure_media_player(player)
+        for player_instance, player in bundles:
+            self.video_player_instances[id(player)] = player_instance
+            self._configure_media_player(player)
         if not pending and not self.is_active_viewer():
-            self._queue_video_cleanup([player])
+            self._queue_video_cleanup(players)
             return
-        self.video_standby_players.append(player)
+        self.video_standby_players.extend(players)
         for request in pending:
             if request["generation"] != self.render_generation or not self.is_active_viewer():
+                continue
+            frame = request["frame"]
+            try:
+                if (
+                    frame is None
+                    or frame.parent() is None
+                    or self.grid.indexOf(frame) < 0
+                    or frame.property("videoGeneration") != request["generation"]
+                    or frame.property("videoPath") != str(request["path"])
+                    or frame.property("videoSlot") != request["slot"]
+                ):
+                    continue
+            except RuntimeError:
+                continue
+            self._start_video_playback(
+                request["path"],
+                frame,
+                primary=request["primary"],
+            )
+
+    def _ensure_video_standby_players(self):
+        if (
+            self.vlc_instance is None
+            or self.video_player_create_inflight
+            or self.video_cleanup_closed
+            or self.video_cleanup_inflight
+            or self.video_retired_players
+        ):
+            return
+        missing = max(0, int(self.performance_policy.video_standby_target) - len(self.video_standby_players))
+        if missing <= 0:
+            return
+        self.video_player_create_inflight = True
+        task = VideoPlayerCreateTask(self.vlc_instance, missing)
+        self.video_player_create_task_refs.add(task)
+        task.signals.finished.connect(
+            self._video_player_fill_finished,
+            Qt.QueuedConnection,
+        )
+        self.video_player_create_thread = threading.Thread(
+            target=task.run,
+            name="PhotoViewer-VLC-PlayerFill",
+            daemon=True,
+        )
+        self.video_player_create_thread.start()
+
+    def _video_player_fill_finished(self, bundles, error, task):
+        self.video_player_create_task_refs.discard(task)
+        self.video_player_create_inflight = False
+        bundles = list(bundles or [])
+        players = [player for _player_instance, player in bundles]
+        for player_instance, player in bundles:
+            self.video_player_instances[id(player)] = player_instance
+            self._configure_media_player(player)
+        if self.video_cleanup_closed or self.vlc_instance is None or not self.is_active_viewer():
+            self._queue_video_cleanup(players)
+            return
+        self.video_standby_players.extend(players)
+        self._dispatch_pending_video_requests()
+        if self.pending_video_requests:
+            QTimer.singleShot(0, self._ensure_video_standby_players)
+        self._resume_pending_navigation()
+
+    def _dispatch_pending_video_requests(self):
+        pending = list(self.pending_video_requests)
+        self.pending_video_requests = []
+        for request in pending:
+            if request["generation"] != self.render_generation:
                 continue
             frame = request["frame"]
             try:
@@ -2198,43 +3464,531 @@ class ViewerWindow(QMainWindow):
         if self.video_loop_enabled:
             QTimer.singleShot(0, lambda current=token: self._restart_video_slot(current))
 
+    def _video_event_type(self, name):
+        if vlc is None:
+            return None
+        return getattr(getattr(vlc, "EventType", None), name, None)
+
+    def _attach_video_ready_events(self, token, state):
+        # Do not bridge libVLC Vout/TimeChanged callbacks into Qt.  Apart from
+        # arriving for an obsolete vout, python-vlc can invoke them on a native
+        # callback thread where PySide signal overload resolution is unsafe.
+        # The active 30 ms timer performs the authoritative readiness checks.
+        state["ready_callbacks"] = []
+        self.video_ready_callbacks[int(token)] = []
+
+    def _begin_video_surface_wait(self, token):
+        state = self.video_slot_states.get(int(token))
+        if state is None:
+            return None
+        state["playback_serial"] = int(state.get("playback_serial", 0)) + 1
+        state["revealed"] = False
+        state["ready_started"] = time.monotonic()
+        state["ready_event_seen"] = False
+        state["ready_samples"] = 0
+        state["last_ready_time"] = -1
+        state["media_committed"] = False
+        # A new Direct3D vout does not inherit all geometry overrides applied
+        # to the previous vout.  Never let the fit cache survive this boundary.
+        state["fit_signature"] = None
+        serial = state["playback_serial"]
+        frame = state.get("frame")
+        path = Path(state.get("path"))
+        if frame is not None:
+            self._show_video_status(frame, "Loading…\n" + path.name)
+        self._attach_video_ready_events(int(token), state)
+        if not self.video_ready_timer.isActive():
+            self.video_ready_timer.start()
+        return serial
+
+    def _mark_video_output_ready(self, token, serial):
+        token = int(token)
+        serial = int(serial)
+        state = self.video_slot_states.get(token)
+        if (
+            state is None
+            or state.get("generation") != self.render_generation
+            or int(state.get("playback_serial", -1)) != serial
+            or state.get("revealed")
+        ):
+            return
+        # VLC events are only wake-up hints.  Vout/TimeChanged can be emitted by
+        # the previous Direct3D output while its final frame is still resident.
+        # The polling gate below validates the current media and real progress.
+        state["ready_event_seen"] = True
+        QTimer.singleShot(0, self.poll_video_output_ready)
+
+    @staticmethod
+    def _media_identity(media):
+        if media is None:
+            return ""
+        try:
+            mrl = media.get_mrl()
+            if mrl:
+                return str(mrl)
+        except Exception:
+            pass
+        return str(media)
+
+    def _video_slot_is_ready(self, state):
+        player = state.get("player")
+        if player is None or not state.get("media_committed"):
+            return False
+        try:
+            current_media = player.get_media()
+        except Exception:
+            current_media = getattr(player, "media", None)
+        expected = str(state.get("expected_media_identity") or "")
+        if expected and self._media_identity(current_media) != expected:
+            return False
+        try:
+            media_time = int(player.get_time())
+        except Exception:
+            media_time = -1
+        try:
+            has_vout = int(player.has_vout())
+        except Exception:
+            has_vout = -1
+        try:
+            player_state = player.get_state()
+        except Exception:
+            player_state = None
+        playable_states = {
+            getattr(getattr(vlc, "State", None), "Playing", None),
+            getattr(getattr(vlc, "State", None), "Paused", None),
+        }
+        valid = media_time > 0 and has_vout > 0 and player_state in playable_states
+        if not valid:
+            state["ready_samples"] = 0
+            state["last_ready_time"] = media_time
+            return False
+        last_time = int(state.get("last_ready_time", -1))
+        state["last_ready_time"] = media_time
+        if last_time >= 0 and media_time >= last_time:
+            state["ready_samples"] = int(state.get("ready_samples", 0)) + 1
+        else:
+            state["ready_samples"] = 1
+        return int(state.get("ready_samples", 0)) >= 2
+
+    @staticmethod
+    def _native_video_frame_size(frame):
+        """Return the VLC HWND client size in physical pixels.
+
+        Qt widget sizes are logical pixels.  libVLC video_set_scale operates
+        on the native Direct3D surface, so using frame.width()/height() on a
+        125-200% DPI display under-scales the video and leaves a black strip.
+        """
+        if frame is None:
+            return QSize()
+        if sys.platform == "win32":
+            try:
+                rect = wintypes.RECT()
+                if ctypes.windll.user32.GetClientRect(
+                    wintypes.HWND(int(frame.winId())), ctypes.byref(rect)
+                ):
+                    width = int(rect.right - rect.left)
+                    height = int(rect.bottom - rect.top)
+                    if width > 0 and height > 0:
+                        return QSize(width, height)
+            except Exception:
+                pass
+        try:
+            dpr = max(1.0, float(frame.devicePixelRatioF()))
+        except Exception:
+            dpr = 1.0
+        return QSize(
+            max(1, round(frame.width() * dpr)),
+            max(1, round(frame.height() * dpr)),
+        )
+
+    @staticmethod
+    def _ratio_text(numerator, denominator):
+        numerator = max(1, int(numerator))
+        denominator = max(1, int(denominator))
+        divisor = math.gcd(numerator, denominator)
+        return f"{numerator // divisor}:{denominator // divisor}"
+
+    @staticmethod
+    def _vlc_video_track_geometry(player):
+        """Read coded size, SAR and orientation from the current VLC media.
+
+        Do not infer source geometry from VLC's output child HWND: that child
+        can still carry the preceding media's vout state during a transition.
+        python-vlc 3.0.21203 also declares libvlc_media_track_t's C union as
+        three sequential pointers, so use the native VLC 3.x layout above.
+        """
+        if player is None or vlc is None or "_VlcMediaTrack" not in globals():
+            return None
+        try:
+            media = player.get_media()
+        except Exception:
+            return None
+        if media is None:
+            return None
+        tracks = ctypes.POINTER(ctypes.POINTER(_VlcMediaTrack))()
+        count = 0
+        try:
+            tracks_get = vlc.dll.libvlc_media_tracks_get
+            tracks_get.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.POINTER(ctypes.POINTER(_VlcMediaTrack))),
+            ]
+            tracks_get.restype = ctypes.c_uint
+            count = int(tracks_get(media, ctypes.byref(tracks)))
+            video_type = int(vlc.TrackType.video.value)
+            for index in range(count):
+                track = tracks[index].contents
+                track_type = getattr(track.type, "value", track.type)
+                if int(track_type) != video_type or not track.track.video:
+                    continue
+                video = track.track.video.contents
+                width = int(video.width)
+                height = int(video.height)
+                sar_num = int(video.sar_num) or 1
+                sar_den = int(video.sar_den) or 1
+                orientation = int(getattr(video.orientation, "value", video.orientation))
+                if width <= 0 or height <= 0 or sar_num <= 0 or sar_den <= 0:
+                    continue
+                swapped = orientation in (4, 5, 6, 7)
+                if swapped:
+                    display_num = height * sar_den
+                    display_den = width * sar_num
+                    display_width = height
+                    display_height = width * sar_num / sar_den
+                else:
+                    display_num = width * sar_num
+                    display_den = height * sar_den
+                    display_width = width * sar_num / sar_den
+                    display_height = height
+                return {
+                    "width": width,
+                    "height": height,
+                    "sar_num": sar_num,
+                    "sar_den": sar_den,
+                    "orientation": orientation,
+                    "swapped": swapped,
+                    "display_num": int(display_num),
+                    "display_den": int(display_den),
+                    "display_width": float(display_width),
+                    "display_height": float(display_height),
+                }
+        except Exception:
+            return None
+        finally:
+            if count > 0 and bool(tracks):
+                try:
+                    tracks_release = vlc.dll.libvlc_media_tracks_release
+                    tracks_release.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                    tracks_release.restype = None
+                    tracks_release(ctypes.cast(tracks, ctypes.c_void_p), count)
+                except Exception:
+                    pass
+        return None
+
+    def _video_fit_config(self, player, frame, state=None):
+        if player is None or frame is None:
+            return None
+        geometry = state.get("track_geometry") if state is not None else None
+        if geometry is None:
+            geometry = self._vlc_video_track_geometry(player)
+            if geometry is not None and state is not None:
+                state["track_geometry"] = geometry
+        if geometry is None:
+            try:
+                source_width, source_height = player.video_get_size(0)
+                source_width = int(source_width)
+                source_height = int(source_height)
+            except Exception:
+                return None
+            geometry = {
+                "width": source_width,
+                "height": source_height,
+                "sar_num": 1,
+                "sar_den": 1,
+                "orientation": 0,
+                "swapped": False,
+                "display_num": source_width,
+                "display_den": source_height,
+                "display_width": float(source_width),
+                "display_height": float(source_height),
+            }
+        native = self._native_video_frame_size(frame)
+        if (
+            geometry["width"] <= 0
+            or geometry["height"] <= 0
+            or native.width() <= 0
+            or native.height() <= 0
+        ):
+            return None
+        display_num = int(geometry["display_num"])
+        display_den = int(geometry["display_den"])
+        display_width = float(geometry["display_width"])
+        display_height = float(geometry["display_height"])
+        source_aspect = display_num / display_den
+        frame_aspect = native.width() / native.height()
+        # VLC already applies SAR and rotation while decoding.  Supplying the
+        # computed display ratio again double-applies rotation for videos with
+        # a 90/270-degree display matrix.  Keep VLC's native aspect here and use
+        # parsed geometry only to decide whether an axis-specific crop is needed.
+        aspect_ratio = None
+        crop_geometry = None
+        zoom = max(0.01, float(self.zoom_factor))
+        if self.fit_mode == "manual":
+            scale = zoom
+        elif self.fit_mode == "actual":
+            scale = 1.0
+        else:
+            # VLC's zero scale lets its vout fill the assigned HWND without
+            # leaving the stale Direct3D picture rectangle produced by a
+            # positive scale.  Crop only when the selected axis cannot fill the
+            # frame; the crop ratio is always derived from the current HWND.
+            scale = 0.0
+            if self.fit_mode == "fit_height" and source_aspect > frame_aspect:
+                crop_geometry = self._ratio_text(native.width(), native.height())
+            elif self.fit_mode == "fit_width" and source_aspect < frame_aspect:
+                crop_geometry = self._ratio_text(native.width(), native.height())
+            if not math.isclose(zoom, 1.0, rel_tol=0.0, abs_tol=1e-6):
+                if self.fit_mode == "fit_width":
+                    scale = native.width() / display_width
+                elif self.fit_mode == "fit_window":
+                    scale = min(
+                        native.width() / display_width,
+                        native.height() / display_height,
+                    )
+                else:
+                    scale = native.height() / display_height
+                scale *= zoom
+        signature = (
+            self.fit_mode,
+            round(zoom, 6),
+            native.width(),
+            native.height(),
+            geometry["width"],
+            geometry["height"],
+            geometry["sar_num"],
+            geometry["sar_den"],
+            geometry["orientation"],
+            aspect_ratio,
+            crop_geometry,
+        )
+        if scale != 0.0:
+            scale = max(0.01, min(100.0, float(scale)))
+        return {
+            "scale": float(scale),
+            "aspect_ratio": aspect_ratio,
+            "crop_geometry": crop_geometry,
+            "signature": signature,
+        }
+
+    def apply_video_fit(self, state):
+        if state is None or state.get("generation") != self.render_generation:
+            return False
+        player = state.get("player")
+        frame = state.get("frame")
+        config = self._video_fit_config(player, frame, state)
+        if config is None:
+            return False
+        signature = config["signature"]
+        if state.get("fit_signature") == signature:
+            return True
+        try:
+            player.video_set_aspect_ratio(config["aspect_ratio"])
+            player.video_set_crop_geometry(config["crop_geometry"])
+            player.video_set_scale(config["scale"])
+        except Exception:
+            return False
+        state["fit_scale"] = config["scale"]
+        state["fit_aspect_ratio"] = config["aspect_ratio"]
+        state["fit_crop_geometry"] = config["crop_geometry"]
+        state["fit_signature"] = signature
+        return True
+
+    def apply_video_fit_to_active_slots(self, generation=None):
+        if generation is not None and generation != self.render_generation:
+            return
+        for state in list(self.video_slot_states.values()):
+            self.apply_video_fit(state)
+
+    def _reveal_video_slot(self, token, serial):
+        token = int(token)
+        serial = int(serial)
+        state = self.video_slot_states.get(token)
+        if (
+            state is None
+            or state.get("generation") != self.render_generation
+            or int(state.get("playback_serial", -1)) != serial
+            or state.get("revealed")
+            or not self.is_active_viewer()
+        ):
+            return False
+        frame = state.get("frame")
+        path = Path(state.get("path"))
+        player = state.get("player")
+        if frame is None or player is None:
+            return False
+        try:
+            if (
+                frame.parent() is None
+                or frame.property("videoGeneration") != state["generation"]
+                or frame.property("videoPath") != str(path)
+            ):
+                return False
+        except RuntimeError:
+            return False
+        if state.get("primary"):
+            if player is not self.media_player:
+                return False
+        elif player not in self.extra_media_players:
+            return False
+        if not self._video_slot_is_ready(state):
+            return False
+        # schedule_image_update() can run before VLC finishes replacing the
+        # old vout.  Its geometry call must not suppress the authoritative
+        # application to the newly-ready output.
+        state["fit_signature"] = None
+        self.apply_video_fit(state)
+        state["revealed"] = True
+        self._hide_video_status(frame)
+        if not any(not item.get("revealed") for item in self.video_slot_states.values()):
+            self.video_ready_timer.stop()
+        return True
+
+    def poll_video_output_ready(self):
+        if self._video_lifecycle_busy():
+            return
+        waiting = False
+        now = time.monotonic()
+        error_states = set()
+        if vlc is not None:
+            error_states = {
+                getattr(vlc.State, "Error", None),
+                getattr(vlc.State, "Stopped", None),
+                getattr(vlc.State, "Ended", None),
+            }
+            error_states.discard(None)
+        for token, state in list(self.video_slot_states.items()):
+            if state.get("revealed") or state.get("generation") != self.render_generation:
+                continue
+            waiting = True
+            if now - float(state.get("ready_started", now)) > VIDEO_READY_TIMEOUT_MS / 1000.0:
+                self._fail_video_slot(token, "Video output timeout")
+                continue
+            frame = state.get("frame")
+            player = state.get("player")
+            if frame is None or player is None:
+                continue
+            # A media can be accepted by ``play()`` and still fail
+            # asynchronously (missing codec, broken file, or a vout that
+            # immediately stops).  Waiting for the full output timeout leaves
+            # a black surface in front of the viewer and used to make the
+            # following image look unreachable.  Retire it as soon as VLC
+            # reports a terminal state; navigation remains independent of
+            # this cleanup worker.
+            try:
+                player_state = player.get_state()
+            except Exception:
+                player_state = None
+            if player_state in error_states:
+                self._fail_video_slot(token, "Could not play video")
+                continue
+            try:
+                label = frame.findChild(QLabel, "videoStatusLabel")
+                if label is not None:
+                    label.setGeometry(frame.rect())
+                    label.raise_()
+            except RuntimeError:
+                continue
+            if self._video_slot_is_ready(state):
+                self._reveal_video_slot(token, int(state.get("playback_serial", 0)))
+        if not waiting:
+            self.video_ready_timer.stop()
+            if self.video_retired_players:
+                self.video_cleanup_idle_timer.start()
+
+    def _fail_video_slot(self, token, reason="Video playback failed"):
+        """Retire a slot whose vout never became usable, without freezing UI."""
+        state = self.video_slot_states.pop(int(token), None)
+        if state is None:
+            return
+        self.video_end_callbacks.pop(int(token), None)
+        self.video_ready_callbacks.pop(int(token), None)
+        player = state.get("player")
+        frame = state.get("frame")
+        if frame is not None:
+            self._show_video_status(frame, reason + "\n" + Path(state.get("path", "")).name)
+            self._hide_video_frame(frame)
+        if player is not None:
+            cancel_event = self.video_start_players.get(id(player))
+            if cancel_event is not None:
+                cancel_event.set()
+            if state.get("primary"):
+                if self.media_player is player:
+                    self.media_player = None
+                self.video_path = None
+            else:
+                self.extra_media_players = [item for item in self.extra_media_players if item is not player]
+            self._quiesce_video_player(player)
+            self._defer_video_cleanup([player])
+        # A slot can fail after a frame-pool shortage queued a render retry.
+        # Do not leave that retry dependent on an unrelated later input event.
+        if self.pending_navigation_index is not None:
+            QTimer.singleShot(0, self._resume_pending_navigation)
+
     def _attach_video_end_event(self, player, path, frame, primary):
         self.video_playback_token += 1
         token = self.video_playback_token
-        try:
-            manager = player.event_manager()
-            manager.event_detach(vlc.EventType.MediaPlayerEndReached)
-        except Exception:
-            manager = None
-        try:
-            callback = lambda _event, current=token: self.videoEnded.emit(current)
-            (manager or player.event_manager()).event_attach(
-                vlc.EventType.MediaPlayerEndReached,
-                callback,
-            )
-            self.video_end_callbacks[token] = callback
-            self.video_slot_states[token] = {
-                "player": player,
-                "path": Path(path),
-                "frame": frame,
-                "primary": bool(primary),
-                "generation": self.render_generation,
-                "ended": False,
-                "restarting": False,
-            }
-            if primary:
-                self._video_end_callback = callback
-            return token
-        except Exception:
-            if primary:
-                self._video_end_callback = None
-            return None
+        # python-vlc invokes EndReached on a native callback thread.  Calling a
+        # typed PySide signal there is not reliable on Windows and can raise or
+        # race a player replacement.  The Qt-owned video timer polls all active
+        # slot states instead, keeping every lifecycle decision on the GUI
+        # thread.
+        callback = None
+        self.video_end_callbacks[token] = None
+        self.video_slot_states[token] = {
+            "player": player,
+            "path": Path(path),
+            "frame": frame,
+            "primary": bool(primary),
+            "generation": self.render_generation,
+            "ended": False,
+            "restarting": False,
+            "playback_serial": 0,
+            "revealed": False,
+            "ready_callbacks": [],
+            "media_committed": False,
+            "expected_media_identity": "",
+            "ready_samples": 0,
+            "last_ready_time": -1,
+            "fit_scale": None,
+            "fit_signature": None,
+        }
+        if primary:
+            self._video_end_callback = callback
+        self._begin_video_surface_wait(token)
+        return token
 
-    def _restart_video_slot(self, token):
+    @staticmethod
+    def _profile_video_step(scope, label, profile):
+        if profile is None:
+            return
+        now = time.perf_counter()
+        print(
+            f"PROFILE_STEP MainThread {scope}.{label} "
+            f"delta={(now - profile[1]) * 1000:.3f}ms total={(now - profile[0]) * 1000:.3f}ms",
+            flush=True,
+        )
+        profile[1] = now
+
+    def _restart_video_slot(self, token, force=False):
+        now = time.perf_counter()
+        profile = [now, now] if os.environ.get("PHOTO_VIEWER_VERIFY_PROFILE") == "1" else None
         token = int(token)
+        if self._video_lifecycle_busy():
+            QTimer.singleShot(50, lambda current=token, forced=force: self._restart_video_slot(current, forced))
+            return True
         state = self.video_slot_states.get(token)
         if (
-            not self.video_loop_enabled
+            (not self.video_loop_enabled and not force)
             or state is None
             or state.get("generation") != self.render_generation
             or state.get("restarting")
@@ -2262,29 +4016,43 @@ class ViewerWindow(QMainWindow):
         except RuntimeError:
             return False
         state["restarting"] = True
-        try:
-            media = self.vlc_instance.media_new(str(path))
-            player.set_media(media)
-            player.set_hwnd(int(frame.winId()))
-            self._configure_media_player(player)
-            try:
-                player.set_time(0)
-            except Exception:
-                pass
-            result = player.play()
-            if result is not None and int(result) < 0:
-                return False
-            player.audio_set_volume(self.volume_slider.value())
-            state["ended"] = False
-            if primary:
-                self.video_finished = False
-                self.video_stopped_by_user = False
-                self.video_timer.start(250)
-            return True
-        except Exception:
+        layout_index = self.grid.indexOf(frame)
+        if layout_index < 0:
             return False
-        finally:
-            state["restarting"] = False
+        row, column, row_span, column_span = self.grid.getItemPosition(layout_index)
+        logical_slot = int(frame.property("videoSlot") or 0)
+        pool_slot = int(frame.property("videoPoolSlot") or 0)
+
+        self.video_retired_callback_refs[id(player)] = state
+        self.video_slot_states.pop(token, None)
+        self.video_end_callbacks.pop(token, None)
+        self.video_ready_callbacks.pop(token, None)
+        if primary:
+            if self.media_player is player:
+                self.media_player = None
+        else:
+            try:
+                self.extra_media_players.remove(player)
+            except ValueError:
+                pass
+        self.grid.removeWidget(frame)
+        self._profile_video_step("restart", "remove_widget", profile)
+        self._profile_video_step("restart", "hide_old_frame", profile)
+        self._defer_video_cleanup([player])
+        self._profile_video_step("restart", "defer_cleanup", profile)
+
+        new_frame = self.video_frame_for_index(pool_slot)
+        self._profile_video_step("restart", "acquire_frame", profile)
+        if new_frame is None:
+            self.pending_navigation_index = self.index
+            self.pending_render_requested = True
+            return True
+        new_frame.setProperty("videoPoolSlot", pool_slot)
+        self.grid.addWidget(new_frame, row, column, row_span, column_span)
+        self._profile_video_step("restart", "add_widget", profile)
+        self.play_video(path, frame=new_frame, primary=primary, slot=logical_slot)
+        self._profile_video_step("restart", "play_video", profile)
+        return True
 
     def set_video_loop_enabled(self, enabled):
         self.video_loop_enabled = bool(enabled)
@@ -2302,11 +4070,15 @@ class ViewerWindow(QMainWindow):
     def load(self, items, index):
         self.items = [Path(p) for p in items if is_media(p)]
         self.index = max(0, min(index, len(self.items) - 1))
-        # Warm libVLC while the user is still looking at an image.  Direct
-        # video opens still use the same asynchronous path, but image-to-video
-        # navigation no longer waits to begin VLC initialization.
+        self.vlc_prewarm_timer.stop()
         if vlc is not None and any(is_video(path) for path in self.items):
-            self._init_vlc_async()
+            if any(is_video(path) for path in self.current_group()):
+                self._init_vlc_async()
+            else:
+                # Let the selected image paint first.  Cold VLC plugin scanning
+                # otherwise contends with its first decode and feels like an
+                # intermittent whole-viewer stall in mixed folders.
+                self.vlc_prewarm_timer.start()
         if not self._app_filter_installed:
             QApplication.instance().installEventFilter(self)
             self._app_filter_installed = True
@@ -2334,6 +4106,8 @@ class ViewerWindow(QMainWindow):
         self.webtoon_scroll = None
         self.webtoon_container = None
         self.webtoon_loaded = set()
+        self.webtoon_label_indices = {}
+        self.webtoon_label_tops = []
         self.webtoon_idle_index = 0
         if hasattr(self, "webtoon_idle_timer"):
             self.webtoon_idle_timer.stop()
@@ -2345,15 +4119,59 @@ class ViewerWindow(QMainWindow):
             item = self.grid.takeAt(0)
             widget = item.widget()
             if widget:
-                if widget is self.video_frame:
-                    widget.hide()
+                if widget in self.video_frames:
+                    # Hiding a child window does not destroy its HWND.  Keep the
+                    # drawable alive for libVLC cleanup, but never leave a stale
+                    # native surface visible above the next image.
+                    self._hide_video_frame(widget)
                 else:
                     widget.hide()
                     widget.deleteLater()
         self.labels = []
 
     def is_animated_image_path(self, path):
-        return Path(path).suffix.lower() in (".gif", ".webp", ".apng")
+        path = Path(path)
+        if path.suffix.lower() not in (".gif", ".webp", ".apng"):
+            return False
+        path_text = str(path)
+        signature = self.item_signatures.get(path_text)
+        if signature is None and path.exists():
+            try:
+                stat = path.stat()
+                signature = (int(stat.st_size), float(stat.st_mtime_ns))
+            except OSError:
+                signature = None
+        cached = self.animated_image_classifications.get(path_text)
+        if cached is not None and cached[0] == signature:
+            return bool(cached[1])
+        # Archive members do not have a directly readable local path.  Their
+        # first ordinary decode reports the real frame count and starts the
+        # animation only when more than one frame actually exists.
+        if path_text in self.archive_sources and not path.exists():
+            return False
+        reader = QImageReader(path_text)
+        try:
+            animated = bool(
+                reader.canRead()
+                and reader.supportsAnimation()
+                and reader.imageCount() != 1
+            )
+        finally:
+            del reader
+        self.animated_image_classifications[path_text] = (signature, animated)
+        return animated
+
+    def remember_animation_classification(self, path, animated):
+        path = Path(path)
+        path_text = str(path)
+        signature = self.item_signatures.get(path_text)
+        if signature is None and path.exists():
+            try:
+                stat = path.stat()
+                signature = (int(stat.st_size), float(stat.st_mtime_ns))
+            except OSError:
+                signature = None
+        self.animated_image_classifications[path_text] = (signature, bool(animated))
 
     def viewer_pixmap_cache_key(self, path):
         path = Path(path)
@@ -2432,7 +4250,11 @@ class ViewerWindow(QMainWindow):
         if key in self.viewer_pixmap_cache_order:
             self.viewer_pixmap_cache_order.remove(key)
         cost = self.pixmap_memory_cost(pixmap)
-        limit = WEBTOON_CACHE_LIMIT_BYTES if self.is_webtoon_viewer_mode() else VIEWER_CACHE_LIMIT_BYTES
+        limit = (
+            min(self.performance_policy.webtoon_cache_limit_bytes, WEBTOON_CACHE_LIMIT_BYTES)
+            if self.is_webtoon_viewer_mode()
+            else min(self.performance_policy.viewer_cache_limit_bytes, VIEWER_CACHE_LIMIT_BYTES)
+        )
         if cost <= 0 or cost > limit:
             return
         self.viewer_pixmap_cache[key] = pixmap
@@ -2459,14 +4281,15 @@ class ViewerWindow(QMainWindow):
         if key in self.webtoon_pixmap_cache_order:
             self.webtoon_pixmap_cache_order.remove(key)
         cost = self.pixmap_memory_cost(pixmap)
-        if cost <= 0 or cost > WEBTOON_CACHE_LIMIT_BYTES:
+        limit = min(self.performance_policy.webtoon_cache_limit_bytes, WEBTOON_CACHE_LIMIT_BYTES)
+        if cost <= 0 or cost > limit:
             return
         self.webtoon_pixmap_cache[key] = pixmap
         self.webtoon_pixmap_cache_order.append(key)
         self.webtoon_pixmap_cache_bytes += cost
         while self.webtoon_pixmap_cache_order and (
             len(self.webtoon_pixmap_cache_order) > 48
-            or self.webtoon_pixmap_cache_bytes > WEBTOON_CACHE_LIMIT_BYTES
+            or self.webtoon_pixmap_cache_bytes > limit
         ):
             old_key = self.webtoon_pixmap_cache_order.pop(0)
             old_pixmap = self.webtoon_pixmap_cache.pop(old_key, None)
@@ -2518,8 +4341,10 @@ class ViewerWindow(QMainWindow):
             pixmaps.append(QPixmap(self.opening_placeholder))
         return pixmaps
 
-    def queue_viewer_decode(self, label, path, generation, priority=20, preload=False):
+    def queue_viewer_decode(self, label, path, generation, priority=20, preload=False, render_token=None):
         path = Path(path)
+        if render_token is None:
+            render_token = self.image_update_token
         key = self.viewer_pixmap_cache_key(path)
         cached = self.viewer_pixmap_cache.get(key)
         if cached is not None and not cached.isNull():
@@ -2531,8 +4356,12 @@ class ViewerWindow(QMainWindow):
         if inflight_key in self.decode_inflight:
             return
         area = self.viewer_area()
-        width = max(320, min(4096, int(area.width() * max(1.0, self.zoom_factor))))
-        height = max(240, min(4096, int(area.height() * max(1.0, self.zoom_factor))))
+        dimension_limit = max(512, int(self.performance_policy.decode_dimension_limit))
+        decode_zoom = max(0.05, min(10.0, float(self.zoom_factor))) if self.fit_mode == "manual" else max(1.0, self.zoom_factor)
+        width_floor = 64 if self.fit_mode == "manual" else 320
+        height_floor = 64 if self.fit_mode == "manual" else 240
+        width = max(width_floor, min(dimension_limit, int(area.width() * decode_zoom)))
+        height = max(height_floor, min(dimension_limit, int(area.height() * decode_zoom)))
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             width = max(WEBTOON_MIN_WIDTH, min(WEBTOON_MAX_WIDTH, int(self.webtoon_target_width or width)))
             height = 4096
@@ -2541,6 +4370,9 @@ class ViewerWindow(QMainWindow):
             path,
             (width, height),
             thread_priority=QThread.IdlePriority if preload else QThread.LowPriority,
+            archive_source=self.archive_sources.get(str(path)),
+            render_token=render_token,
+            cache_key=key,
         )
         self.decode_inflight.add(inflight_key)
         self.decode_task_refs.add(task)
@@ -2557,6 +4389,18 @@ class ViewerWindow(QMainWindow):
         self.decode_inflight.discard(inflight_key)
         if generation != self.render_generation:
             return
+        metadata = metadata or {}
+        if "animated" in metadata:
+            self.remember_animation_classification(path, metadata.get("animated"))
+        result_render_token = int(metadata.get("render_token", 0) or 0)
+        if result_render_token and result_render_token != self.image_update_token:
+            return
+        result_cache_key = metadata.get("cache_key")
+        if result_cache_key is not None and result_cache_key != self.viewer_pixmap_cache_key(Path(path)):
+            return
+        image_size = tuple(metadata.get("image_size") or ())
+        if len(image_size) == 2:
+            self.archive_image_sizes[str(path)] = image_size
         pixmap = QPixmap()
         if isinstance(payload, QImage):
             pixmap = QPixmap.fromImage(payload)
@@ -2574,12 +4418,30 @@ class ViewerWindow(QMainWindow):
         self.store_viewer_pixmap(cache_key, scaled)
         if label is not None and label.parent() is not None:
             if self.viewer_mode in ("webtoon", "webtoon_vertical"):
+                label_index = self.webtoon_label_indices.get(id(label))
+                visible_indices = set(
+                    self.visible_webtoon_indices(
+                        margin=max(2, int(self.performance_policy.webtoon_lookahead) + 1)
+                    )
+                )
+                # A decode can finish after the user has scrolled away.  Keep
+                # the bounded cache entry, but do not attach a large QPixmap
+                # to an off-screen label (QLabel ownership otherwise defeats
+                # the cache cap).
+                if label_index is not None and label_index not in visible_indices:
+                    label.setPixmap(QPixmap())
+                    label.setText(Path(path).name)
+                    self.webtoon_loaded.discard(label_index)
+                    return
                 label.setFixedSize(scaled.size())
             else:
                 label.setMinimumHeight(0)
+            label.setProperty("loadingPlaceholder", False)
             label.setText("")
             label.setPixmap(scaled)
             self.opening_placeholder = QPixmap()
+            if metadata.get("animated"):
+                self.try_start_animated_image(label, Path(path))
             if self.viewer_mode in ("webtoon", "webtoon_vertical"):
                 for idx, (candidate, _) in enumerate(self.labels):
                     if candidate is label:
@@ -2591,6 +4453,38 @@ class ViewerWindow(QMainWindow):
         self.viewer_preload_queue = []
         self.viewer_preload_queued = set()
         self.viewer_preload_timer.stop()
+        lookahead = max(0, int(self.performance_policy.viewer_lookahead))
+        if lookahead <= 0 or not self.items or self.viewer_mode in ("webtoon", "webtoon_vertical"):
+            return
+
+        group_size = {"double": 2, "triple": 3}.get(self.viewer_mode, 1)
+        step = group_size if self.step_mode in ("page", "manga_page") else 1
+        current_paths = {str(path) for path in self.current_group()}
+        queued = []
+        for distance in range(1, lookahead + 1):
+            start = self.index + step * distance
+            if start >= len(self.items):
+                break
+            for path in self.items[start:start + group_size]:
+                path_text = str(path)
+                if (
+                    path_text in current_paths
+                    or path_text in self.viewer_preload_queued
+                    or not is_image(path)
+                    or self.is_animated_image_path(path)
+                ):
+                    continue
+                key = self.viewer_pixmap_cache_key(path)
+                if key in self.viewer_pixmap_cache:
+                    continue
+                self.viewer_preload_queued.add(path_text)
+                queued.append(path)
+        self.viewer_preload_queue = queued
+        if self.viewer_preload_queue:
+            # Preloading starts only after the current image has had a chance
+            # to paint.  One idle worker and the bounded viewer cache prevent
+            # a large folder from turning this into a bulk decode operation.
+            self.viewer_preload_timer.start(self.performance_policy.thumbnail_gap_ms)
 
     def process_next_viewer_preload(self):
         if not self.viewer_preload_queue:
@@ -2600,16 +4494,59 @@ class ViewerWindow(QMainWindow):
         self.viewer_preload_queued.discard(str(path))
         self.queue_viewer_decode(None, path, self.render_generation, priority=-10, preload=True)
         if self.viewer_preload_queue:
-            profile = PERFORMANCE_PROFILES.get(
-                self.settings.get("performance_profile", "balanced"), PERFORMANCE_PROFILES["balanced"]
-            )
-            self.viewer_preload_timer.start(profile["thumbnail_gap_ms"])
+            self.viewer_preload_timer.start(self.performance_policy.thumbnail_gap_ms)
+
+    def reuse_static_image_grid(self, prepared_items, generation):
+        """Retarget existing image labels without exposing an empty frame."""
+        if not prepared_items or len(self.labels) != len(prepared_items):
+            return False
+        if any(item["video"] or item["animated"] for item in prepared_items):
+            return False
+        if any(
+            not isinstance(label, PannableImageLabel)
+            or not is_image(old_path)
+            or self.is_animated_image_path(old_path)
+            for label, old_path in self.labels
+        ):
+            return False
+
+        rebound = []
+        for (label, _old_path), item in zip(self.labels, prepared_items):
+            path = item["path"]
+            label._pan_offset = QPoint(0, 0)
+            label._selection_rect = QRect()
+            display_pixmap = item["pix"]
+            if not display_pixmap.isNull():
+                label.setProperty("loadingPlaceholder", False)
+                label.setText("")
+                label.setPixmap(display_pixmap)
+            else:
+                # Keep the preceding frame visible until this decode is ready.
+                # Replacing the QLabel here caused Windows to briefly expose
+                # the backing surface between every pair of images.
+                label.setProperty("loadingPlaceholder", True)
+                if getattr(label, "_viewer_pixmap", QPixmap()).isNull():
+                    label.setText("Loading…")
+                self.queue_viewer_decode(label, path, generation, priority=20)
+            rebound.append((label, path))
+        self.labels = rebound
+        return True
 
     def show_current(self, reset=False):
+        # A VLC start may still be inside a native call (notably on the first
+        # file after a cold install).  Rendering the next item must not wait
+        # for that call: ``clear_grid`` marks the old player cancelled and the
+        # worker retires it on its own thread.  The old implementation treated
+        # every in-flight start as a global navigation lock, so a decoder that
+        # stayed black also prevented the following image from ever appearing.
         transition_pixmaps = self.transition_pixmaps()
         self.cancel_pending_decodes()
         self.render_generation += 1
+        self.image_update_token += 1
         generation = self.render_generation
+        self.current_has_animation = False
+        if hasattr(self, "animated_rate_btn"):
+            self.animated_rate_btn.hide()
         if reset:
             self.fit_mode = self.settings.get("default_fit", "fit_height")
             self.fit_combo.setCurrentText(self.fit_mode)
@@ -2621,14 +4558,30 @@ class ViewerWindow(QMainWindow):
         if group and self.viewer_mode not in ("webtoon", "webtoon_vertical"):
             prepared_items = self.build_prepared_viewer_items(group, active_video_slots)
 
-        self.clear_grid()
         self.active_display_path = self.focus_path_for_group(group)
+        if (
+            group
+            and not active_video_slots
+            and self.reuse_static_image_grid(prepared_items, generation)
+        ):
+            self.current_is_video = False
+            self.queue_viewer_preloads()
+            title_name = self.active_display_path.name if self.active_display_path else self.items[self.index].name
+            self.setWindowTitle(f"{APP_NAME} - {self.index + 1}/{len(self.items)} - {title_name}")
+            self.update_filename_labels()
+            self.position_overlays()
+            return
+
+        self.central.setUpdatesEnabled(False)
+        self.clear_grid()
         if not group:
             label = QLabel("No media")
             label.setAlignment(Qt.AlignCenter)
             label.setAttribute(Qt.WA_StyledBackground, True)
             label.setStyleSheet("background: #050505; color: #f0f0f0;")
             self.grid.addWidget(label, 0, 0)
+            self.central.setUpdatesEnabled(True)
+            self.central.update()
             return
 
         self.current_is_video = bool(active_video_slots)
@@ -2670,13 +4623,24 @@ class ViewerWindow(QMainWindow):
                 self.webtoon_build_timer.start()
         else:
             primary_video_assigned = False
+            active_video_frame_index = 0
             for item in prepared_items or []:
                 col = item["col"]
                 path = item["path"]
                 if item["active_video"]:
                     primary = not primary_video_assigned
+                    frame = self.video_frame_for_index(active_video_frame_index)
+                    active_video_frame_index += 1
+                    if frame is None:
+                        label = QLabel("Preparing video surface…")
+                        label.setAlignment(Qt.AlignCenter)
+                        label.setAttribute(Qt.WA_StyledBackground, True)
+                        label.setStyleSheet("background: #050505; color: #f0f0f0;")
+                        self.grid.addWidget(label, 0, col)
+                        self.pending_navigation_index = self.index
+                        self.pending_render_requested = True
+                        continue
                     primary_video_assigned = True
-                    frame = self.video_frame if primary else self.create_video_frame()
                     self.grid.addWidget(frame, 0, col)
                     self.play_video(path, frame=frame, primary=primary, slot=col)
                 elif item["video"]:
@@ -2688,7 +4652,14 @@ class ViewerWindow(QMainWindow):
                     label.setText("Loading…")
                     label.setToolTip(Path(path).name)
                     self.grid.addWidget(label, 0, col)
-                    task = ImageDecodeTask(generation, path, (512, 512), video_shell=True)
+                    task = ImageDecodeTask(
+                        generation,
+                        path,
+                        (512, 512),
+                        video_shell=True,
+                        render_token=self.image_update_token,
+                        cache_key=self.viewer_pixmap_cache_key(Path(path)),
+                    )
                     self.decode_task_refs.add(task)
                     task.signals.finished.connect(
                         lambda result_generation, result_path, payload, metadata, ref=task, target=label: self.viewer_decode_ready(
@@ -2735,6 +4706,8 @@ class ViewerWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} - {self.index + 1}/{len(self.items)} - {title_name}")
         self.update_filename_labels()
         self.position_overlays()
+        self.central.setUpdatesEnabled(True)
+        self.central.update()
 
     def active_video_slots_for_group(self, group):
         if not group:
@@ -2770,21 +4743,36 @@ class ViewerWindow(QMainWindow):
             self.top_filename_label,
             self.rotation_filename_label,
             self.video_filename_label,
-            self.corner_filename_label,
         ):
             label.setText(name)
             label.setToolTip(name)
 
     def schedule_image_update(self, generation=None):
-        if not self.is_active_viewer():
+        if not self.is_active_viewer() or self.app_closing:
             return
         generation = self.render_generation if generation is None else generation
+        self.image_update_pending_generation = generation
+        self.image_update_timer.start()
+
+    def _apply_scheduled_image_update(self):
+        generation = self.image_update_pending_generation
+        self.image_update_pending_generation = None
+        if self.app_closing or generation != self.render_generation or not self.is_active_viewer():
+            return
+        self.image_update_token += 1
+        self.apply_video_fit_to_active_slots(generation)
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             self.reset_webtoon_target_width()
-            self.schedule_webtoon_visible_update(generation)
-            return
-        QTimer.singleShot(0, lambda g=generation: self.update_image_labels(g))
-        QTimer.singleShot(40, lambda g=generation: self.update_image_labels(g))
+            self.update_webtoon_visible_images(generation)
+        else:
+            self.update_image_labels(generation)
+        # One delayed geometry pass is retained for VLC's vout, whose native
+        # size can become available just after the Qt resize event.
+        QTimer.singleShot(40, lambda g=generation, token=self.image_update_token: (
+            self.apply_video_fit_to_active_slots(g)
+            if not self.app_closing and g == self.render_generation and token == self.image_update_token
+            else None
+        ))
 
     def schedule_webtoon_visible_update(self, generation=None):
         generation = self.render_generation if generation is None else generation
@@ -2792,6 +4780,9 @@ class ViewerWindow(QMainWindow):
         QTimer.singleShot(60, lambda g=generation: self.update_webtoon_visible_images(g))
 
     def image_pixel_size(self, path):
+        archive_size = self.archive_image_sizes.get(str(path))
+        if archive_size:
+            return QSize(int(archive_size[0]), int(archive_size[1]))
         reader = QImageReader(str(path))
         size = reader.size()
         if size.isValid() and size.width() > 0 and size.height() > 0:
@@ -2860,15 +4851,83 @@ class ViewerWindow(QMainWindow):
         return pix
 
     def create_video_frame(self):
-        frame = QFrame()
+        frame = QFrame(self.central)
         frame.setObjectName("videoFrame")
         frame.setAttribute(Qt.WA_StyledBackground, True)
+        frame.setAttribute(Qt.WA_NativeWindow, True)
         frame.setStyleSheet("background: #000;")
         frame.setAutoFillBackground(True)
         frame.setFocusPolicy(Qt.StrongFocus)
         frame.setMouseTracking(True)
         frame.installEventFilter(self)
         return frame
+
+    def video_frame_for_index(self, index):
+        index = max(0, int(index))
+        pool = self.video_frame_pools.setdefault(index, [])
+        active_frame_ids = {
+            id(state.get("frame"))
+            for state in self.video_slot_states.values()
+            if state.get("frame") is not None
+        }
+        for frame in pool:
+            if id(frame) not in self.video_frame_busy and id(frame) not in active_frame_ids:
+                return frame
+        if len(pool) >= VIDEO_MAX_FRAMES_PER_SLOT:
+            return None
+        frame = self.create_video_frame()
+        frame.setProperty("videoPoolSlot", index)
+        pool.append(frame)
+        self.video_frames.append(frame)
+        return frame
+
+    @staticmethod
+    def _hide_video_frame(frame):
+        if frame is None:
+            return
+        try:
+            frame.lower()
+            frame.hide()
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _native_video_handle(frame):
+        if frame is None:
+            return 0
+        try:
+            frame.setAttribute(Qt.WA_NativeWindow, True)
+            hwnd = int(frame.winId())
+        except (RuntimeError, TypeError, ValueError):
+            return 0
+        if hwnd <= 0:
+            return 0
+        if (
+            sys.platform == "win32"
+            and os.environ.get("QT_QPA_PLATFORM", "").lower() not in ("offscreen", "minimal")
+        ):
+            try:
+                if not ctypes.windll.user32.IsWindow(wintypes.HWND(hwnd)):
+                    return 0
+            except Exception:
+                return 0
+        return hwnd
+
+    def prime_video_frame_geometry(self, frame):
+        """Size a fresh native video surface before libVLC binds its HWND.
+
+        Retired VLC surfaces must stay alive until their players are released,
+        so navigation can legitimately allocate a brand-new QFrame.  A new
+        QFrame starts at Qt's 640x480 default and the grid layout is applied on
+        a later event-loop pass.  Binding libVLC before that pass makes the
+        first frames render at 640x480 and then visibly jump to the viewer size.
+        Prime only the transient geometry here; the grid remains responsible
+        for the final position and size.
+        """
+        target = self.viewer_area()
+        if target.width() > 0 and target.height() > 0 and frame.size() != target:
+            frame.resize(target)
+        frame.updateGeometry()
 
     def _show_video_status(self, frame, text):
         try:
@@ -2879,6 +4938,7 @@ class ViewerWindow(QMainWindow):
                 label.setAlignment(Qt.AlignCenter)
                 label.setAttribute(Qt.WA_StyledBackground, True)
                 label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                label.setAttribute(Qt.WA_NativeWindow, True)
                 label.setStyleSheet("background: #050505; color: #f0f0f0; font-size: 10pt;")
             label.setText(text)
             label.setGeometry(frame.rect())
@@ -2898,6 +4958,7 @@ class ViewerWindow(QMainWindow):
     def play_video(self, path, frame=None, primary=True, slot=0):
         path = Path(path)
         frame = frame or self.video_frame
+        self.prime_video_frame_geometry(frame)
         frame.setProperty("videoGeneration", self.render_generation)
         frame.setProperty("videoPath", str(path))
         frame.setProperty("videoSlot", int(slot))
@@ -2926,15 +4987,35 @@ class ViewerWindow(QMainWindow):
         self._start_video_playback(path, frame, primary=primary)
 
     def _start_video_playback(self, path, frame, primary=True):
+        now = time.perf_counter()
+        profile = [now, now] if os.environ.get("PHOTO_VIEWER_VERIFY_PROFILE") == "1" else None
         if primary and self.media_player is None and self.vlc_instance is not None:
             try:
                 self.media_player = self._acquire_video_player()
             except Exception:
                 self.media_player = None
         player = self.media_player if primary else self._acquire_video_player()
+        self._profile_video_step("start", "acquire_player", profile)
         if not player:
-            self._show_video_status(frame, "Video player unavailable\n" + Path(path).name)
+            self._show_video_status(frame, "Preparing video player…\n" + Path(path).name)
+            request = {
+                "generation": self.render_generation,
+                "path": Path(path),
+                "frame": frame,
+                "primary": bool(primary),
+                "slot": int(frame.property("videoSlot") or 0),
+            }
+            self.pending_video_requests = [
+                item for item in self.pending_video_requests
+                if not (
+                    item["generation"] == request["generation"]
+                    and item["slot"] == request["slot"]
+                )
+            ]
+            self.pending_video_requests.append(request)
+            self._ensure_video_standby_players()
             return
+        token = None
         try:
             if primary:
                 self.video_path = Path(path)
@@ -2944,41 +5025,261 @@ class ViewerWindow(QMainWindow):
                 self.extra_media_players.append(player)
             frame.setVisible(True)
             frame.show()
+            self._profile_video_step("start", "set_visible", profile)
             frame.raise_()
+            self._profile_video_step("start", "raise_frame", profile)
             frame.repaint()
-            self._hide_video_status(frame)
-            media = self.vlc_instance.media_new(str(path))
-            player.set_media(media)
-            player.set_hwnd(int(frame.winId()))
+            self._show_video_status(frame, "Loading…\n" + Path(path).name)
+            self._profile_video_step("start", "show_status", profile)
+            previous_frame = self.video_player_frames.get(id(player))
+            previous_frame_id = id(previous_frame) if previous_frame is not None else 0
+            self.video_player_frames[id(player)] = frame
+            self.video_frame_busy.add(id(frame))
+            player_instance = self.video_player_instances.get(id(player))
+            if player_instance is None:
+                raise RuntimeError("Video player instance is unavailable")
+            hwnd = self._native_video_handle(frame)
+            if hwnd <= 0:
+                raise RuntimeError("Native video surface is unavailable")
             self._configure_media_player(player)
-            self._attach_video_end_event(player, path, frame, primary)
-            result = player.play()
-            if result is not None and int(result) < 0:
-                raise RuntimeError("libVLC rejected playback")
-            player.audio_set_volume(self.volume_slider.value())
-            if primary:
-                self.video_timer.start(250)
-                frame.setFocus()
+            token = self._attach_video_end_event(player, path, frame, primary)
+            self._profile_video_step("start", "attach_state", profile)
+            cancel_event = threading.Event()
+            self.video_start_players[id(player)] = cancel_event
+            self.video_start_started[id(player)] = time.monotonic()
+            player_lock = self.video_player_locks.setdefault(id(player), threading.RLock())
+            self.video_start_inflight += 1
+            self.video_start_queue.put({
+                "player": player,
+                "instance": player_instance,
+                "path": str(path),
+                "hwnd": hwnd,
+                "rate": float(self.playback_rate),
+                "volume": int(self.volume_slider.value()),
+                "primary": bool(primary),
+                "token": int(token),
+                "generation": int(self.render_generation),
+                "previous_frame_id": int(previous_frame_id),
+                "cancel_event": cancel_event,
+                "lock": player_lock,
+            })
+            self._profile_video_step("start", "queue_play", profile)
         except Exception:
             if primary:
                 self.video_path = None
+                if self.media_player is player:
+                    self.media_player = None
             else:
                 try:
                     self.extra_media_players.remove(player)
                 except ValueError:
                     pass
+            self.video_start_players.pop(id(player), None)
+            self.video_start_started.pop(id(player), None)
+            if token is not None:
+                self.video_slot_states.pop(token, None)
+                self.video_end_callbacks.pop(token, None)
+                self.video_ready_callbacks.pop(token, None)
+            self._quiesce_video_player(player)
+            self._queue_video_cleanup([player])
+            self._show_video_status(frame, "Could not play video\n" + Path(path).name)
+
+    @staticmethod
+    def _video_start_worker(work_queue, signals):
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.kernel32.SetThreadPriority(
+                    ctypes.windll.kernel32.GetCurrentThread(), -1
+                )
+            except Exception:
+                pass
+        while True:
+            item = work_queue.get()
+            if item is None:
+                work_queue.task_done()
+                return
+            error = ""
+            media_identity = ""
+            released = False
+            player_lock = item.get("lock")
+            lock_acquired = False
+            try:
+                player = item["player"]
+                if player_lock is not None:
+                    player_lock.acquire()
+                    lock_acquired = True
+                cancel_event = item["cancel_event"]
+                if cancel_event.is_set():
+                    raise RuntimeError("Video start cancelled")
+                media = item["instance"].media_new(item["path"])
+                player.set_media(media)
+                player.set_hwnd(int(item["hwnd"]))
                 try:
-                    player.release()
+                    player.video_set_mouse_input(False)
+                    player.video_set_key_input(False)
                 except Exception:
                     pass
-            self._show_video_status(frame, "Could not play video\n" + Path(path).name)
+                for method_name, value in (
+                    ("video_set_scale", 0.0),
+                    ("video_set_aspect_ratio", None),
+                    ("video_set_crop_geometry", None),
+                ):
+                    try:
+                        getattr(player, method_name)(value)
+                    except Exception:
+                        pass
+                try:
+                    media_identity = str(media.get_mrl() or "")
+                except Exception:
+                    media_identity = str(media)
+                if cancel_event.is_set():
+                    raise RuntimeError("Video start cancelled")
+                result = player.play()
+                if result is not None and int(result) < 0:
+                    raise RuntimeError("libVLC rejected playback")
+                try:
+                    player.set_rate(float(item["rate"]))
+                except Exception:
+                    pass
+                try:
+                    player.audio_set_mute(not bool(item.get("primary", True)))
+                except Exception:
+                    pass
+                try:
+                    player.audio_set_volume(int(item["volume"]))
+                except Exception:
+                    pass
+                if cancel_event.is_set():
+                    try:
+                        player.audio_set_mute(True)
+                    except Exception:
+                        pass
+                    try:
+                        player.audio_set_volume(0)
+                    except Exception:
+                        pass
+                    try:
+                        player.set_pause(1)
+                    except Exception:
+                        pass
+                    try:
+                        player.stop()
+                    except Exception:
+                        pass
+                    try:
+                        player.release()
+                    except Exception:
+                        pass
+                    released = True
+                    raise RuntimeError("Video start cancelled")
+            except Exception as exc:
+                error = str(exc)
+                if item.get("cancel_event") is not None and item["cancel_event"].is_set() and not released:
+                    try:
+                        item["player"].audio_set_mute(True)
+                    except Exception:
+                        pass
+                    try:
+                        item["player"].audio_set_volume(0)
+                    except Exception:
+                        pass
+                    try:
+                        item["player"].stop()
+                    except Exception:
+                        pass
+                    try:
+                        item["player"].release()
+                    except Exception:
+                        pass
+                    released = True
+            payload = dict(item)
+            payload["media_identity"] = media_identity
+            payload["error"] = error
+            payload["released"] = released
+            try:
+                if getattr(signals, "accept_results", True):
+                    signals.finished.emit(payload)
+            except RuntimeError:
+                pass
+            finally:
+                if lock_acquired:
+                    try:
+                        player_lock.release()
+                    except Exception:
+                        pass
+                work_queue.task_done()
+
+    def _video_start_finished(self, payload):
+        self.video_start_inflight = max(0, int(self.video_start_inflight) - 1)
+        player = payload.get("player")
+        if player is not None:
+            self.video_start_players.pop(id(player), None)
+            self.video_start_started.pop(id(player), None)
+        previous_frame_id = int(payload.get("previous_frame_id") or 0)
+        if previous_frame_id:
+            self.video_frame_busy.discard(previous_frame_id)
+        token = int(payload.get("token", 0))
+        state = self.video_slot_states.get(token)
+        active = (
+            state is not None
+            and state.get("generation") == payload.get("generation")
+            and state.get("player") is player
+        )
+        if active:
+            error = str(payload.get("error") or "")
+            if error:
+                self._show_video_status(state.get("frame"), "Could not play video\n" + Path(state["path"]).name)
+                self.video_slot_states.pop(token, None)
+                self.video_end_callbacks.pop(token, None)
+                self.video_ready_callbacks.pop(token, None)
+                if state.get("primary"):
+                    if self.media_player is player:
+                        self.media_player = None
+                    self.video_path = None
+                else:
+                    try:
+                        self.extra_media_players.remove(player)
+                    except ValueError:
+                        pass
+                if not payload.get("released"):
+                    self._quiesce_video_player(player)
+                    self._queue_video_cleanup([player])
+            else:
+                state["expected_media_identity"] = str(payload.get("media_identity") or "")
+                state["media_committed"] = True
+                if state.get("primary"):
+                    self.video_timer.start(250)
+                    try:
+                        state["frame"].setFocus()
+                    except RuntimeError:
+                        pass
+        else:
+            frame = self.video_player_frames.get(id(player)) if player is not None else None
+            self._hide_video_frame(frame)
+            if payload.get("released"):
+                self.video_player_frames.pop(id(player), None)
+                self.video_player_instances.pop(id(player), None)
+                self.video_retired_callback_refs.pop(id(player), None)
+                if frame is not None:
+                    self.video_frame_busy.discard(id(frame))
+            elif player is not None:
+                self._quiesce_video_player(player)
+                self._defer_video_cleanup([player])
+        if self.video_start_inflight == 0:
+            self._resume_pending_navigation()
 
     def _acquire_video_player(self):
         if self.video_standby_players:
             player = self.video_standby_players.pop(0)
         else:
-            player = self.vlc_instance.media_player_new()
+            self._ensure_video_standby_players()
+            return None
         self._configure_media_player(player)
+        try:
+            player.audio_set_mute(True)
+            player.audio_set_volume(0)
+        except Exception:
+            pass
         return player
 
     def make_video_preview_label(self, path):
@@ -3037,20 +5338,40 @@ class ViewerWindow(QMainWindow):
         return pix
 
     @staticmethod
-    def _video_cleanup_worker(work_queue):
-        """Run potentially blocking libVLC stop/release calls off the GUI thread."""
+    def _video_cleanup_worker(work_queue, signals):
+        """Stop retired players off the GUI thread while their HWNDs stay valid."""
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.kernel32.SetThreadPriority(
+                    ctypes.windll.kernel32.GetCurrentThread(), -2
+                )
+            except Exception:
+                pass
         while True:
-            player = work_queue.get()
-            if player is None:
+            item = work_queue.get()
+            if item is None:
                 work_queue.task_done()
                 return
+            player, frame_id, player_instance, player_lock = item
+            lock_acquired = False
             try:
+                if player_lock is not None:
+                    player_lock.acquire()
+                    lock_acquired = True
                 try:
-                    player.stop()
+                    player.audio_set_mute(True)
                 except Exception:
                     pass
                 try:
-                    player.set_media(None)
+                    player.audio_set_volume(0)
+                except Exception:
+                    pass
+                try:
+                    player.set_pause(1)
+                except Exception:
+                    pass
+                try:
+                    player.stop()
                 except Exception:
                     pass
                 try:
@@ -3058,6 +5379,16 @@ class ViewerWindow(QMainWindow):
                 except Exception:
                     pass
             finally:
+                if lock_acquired:
+                    try:
+                        player_lock.release()
+                    except Exception:
+                        pass
+                try:
+                    if getattr(signals, "accept_results", True):
+                        signals.finished.emit(int(id(player)), int(frame_id or 0))
+                except RuntimeError:
+                    pass
                 work_queue.task_done()
 
     @staticmethod
@@ -3072,106 +5403,266 @@ class ViewerWindow(QMainWindow):
         return unique
 
     def _quiesce_video_player(self, player):
-        """Silence and detach a player without waiting for libVLC stop()."""
+        """Immediately mute and pause while preserving the attached HWND."""
+        if player is None:
+            return False
+        lock = self.video_player_locks.setdefault(id(player), threading.RLock())
+        acquired = lock.acquire(timeout=0.02)
+        if not acquired:
+            # The start/cleanup worker owns the player.  Its cancel flag is
+            # checked before and after native calls, so blocking the GUI here
+            # would only turn a quick navigation into a freeze.
+            return False
         try:
-            player.audio_set_volume(0)
-        except Exception:
-            pass
-        try:
-            player.set_pause(1)
-        except Exception:
-            pass
-        try:
-            player.set_hwnd(0)
-        except Exception:
-            pass
+            try:
+                player.audio_set_mute(True)
+            except Exception:
+                pass
+            try:
+                player.audio_set_volume(0)
+            except Exception:
+                pass
+            try:
+                player.set_pause(1)
+            except Exception:
+                pass
+        finally:
+            lock.release()
+        return True
 
     def _take_active_video_players(self):
+        now = time.perf_counter()
+        profile = [now, now] if os.environ.get("PHOTO_VIEWER_VERIFY_PROFILE") == "1" else None
         self.movie = None
         self.stop_animated_image()
+        self._profile_video_step("take", "stop_animation", profile)
         self.pending_video_requests = []
         self.video_playback_token += 1
         self._video_end_callback = None
-        for token, state in list(getattr(self, "video_slot_states", {}).items()):
-            try:
-                state["player"].event_manager().event_detach(vlc.EventType.MediaPlayerEndReached)
-            except Exception:
-                pass
+        for _token, state in list(getattr(self, "video_slot_states", {}).items()):
+            player = state.get("player")
+            if player is not None:
+                self.video_retired_callback_refs[id(player)] = state
         self.video_slot_states = {}
         self.video_end_callbacks = {}
+        self.video_ready_callbacks = {}
         self.video_stopped_by_user = True
         self.video_finished = False
         if hasattr(self, "video_timer"):
             self.video_timer.stop()
+        if hasattr(self, "video_ready_timer"):
+            self.video_ready_timer.stop()
+        self._profile_video_step("take", "clear_state", profile)
         players = self._unique_video_players(
             [self.media_player, *getattr(self, "extra_media_players", [])]
         )
+        ready_for_cleanup = []
+        for player in players:
+            cancel_event = self.video_start_players.get(id(player))
+            if cancel_event is not None:
+                cancel_event.set()
+            self._quiesce_video_player(player)
+            frame = self.video_player_frames.get(id(player))
+            self._hide_video_frame(frame)
+            if cancel_event is None:
+                ready_for_cleanup.append(player)
+        self._profile_video_step("take", "quiesce_players", profile)
         self.extra_media_players = []
         self.media_player = None
-        try:
-            self.video_frame.hide()
-        except RuntimeError:
-            pass
+        self._profile_video_step("take", "hide_frames", profile)
         self.video_path = None
         if hasattr(self, "seek_slider"):
             self.seek_slider.blockSignals(True)
             self.seek_slider.setValue(0)
             self.seek_slider.blockSignals(False)
             self.time_label.setText("00:00 / 00:00")
-        return players
+        self._profile_video_step("take", "reset_controls", profile)
+        return ready_for_cleanup
+
+    def _video_cleanup_finished(self, player_id, frame_id):
+        frame = self.video_player_frames.pop(int(player_id), None)
+        self.video_player_instances.pop(int(player_id), None)
+        self.video_player_locks.pop(int(player_id), None)
+        self.video_retired_callback_refs.pop(int(player_id), None)
+        if frame_id:
+            self.video_frame_busy.discard(int(frame_id))
+        if frame is not None:
+            self._hide_video_frame(frame)
+        self.video_cleanup_inflight = max(0, int(self.video_cleanup_inflight) - 1)
+        if self.video_cleanup_inflight == 0 and not self.video_retired_players:
+            self._release_retired_vlc_instances()
+            if self.pending_navigation_index is not None and self.video_standby_players:
+                QTimer.singleShot(0, self._resume_pending_navigation)
+            else:
+                if self.pending_video_requests and self.video_standby_players:
+                    QTimer.singleShot(0, self._dispatch_pending_video_requests)
+                QTimer.singleShot(0, self._ensure_video_standby_players)
 
     def _queue_video_cleanup(self, players):
-        for player in self._unique_video_players(players):
+        players = self._unique_video_players(players)
+        self.video_cleanup_inflight += len(players)
+        if players and not self.video_cleanup_closed and not self.video_cleanup_thread.is_alive():
+            # A native VLC exception must not permanently disable cleanup for
+            # the rest of the session.  Recreate the single worker before
+            # enqueueing the next retired player.
+            self.video_cleanup_thread = threading.Thread(
+                target=self._video_cleanup_worker,
+                args=(self.video_cleanup_queue, self.video_cleanup_signals),
+                name="PhotoViewer-VLC-Cleanup",
+                daemon=True,
+            )
+            self.video_cleanup_thread.start()
+        for player in players:
+            frame = self.video_player_frames.get(id(player))
+            player_instance = self.video_player_instances.get(id(player))
+            frame_id = id(frame) if frame is not None else 0
+            if frame_id:
+                self.video_frame_busy.add(frame_id)
             if self.video_cleanup_closed:
+                self._quiesce_video_player(player)
                 try:
                     player.stop()
-                except Exception:
-                    pass
-                try:
-                    player.set_media(None)
                 except Exception:
                     pass
                 try:
                     player.release()
                 except Exception:
                     pass
+                self._video_cleanup_finished(id(player), frame_id)
                 continue
-            self.video_cleanup_queue.put(player)
+            player_lock = self.video_player_locks.setdefault(id(player), threading.RLock())
+            self.video_cleanup_queue.put((player, frame_id, player_instance, player_lock))
 
-    def retire_media_for_transition(self):
-        """Detach immediately, then retire old players without blocking navigation."""
-        players = self._take_active_video_players()
-        for player in players:
-            self._quiesce_video_player(player)
+    def _reserve_video_cleanup_frames(self, players):
+        for player in self._unique_video_players(players):
+            frame = self.video_player_frames.get(id(player))
+            if frame is not None:
+                self.video_frame_busy.add(id(frame))
+
+    def _defer_video_cleanup(self, players):
+        players = self._unique_video_players(players)
+        if not players:
+            return
+        self._reserve_video_cleanup_frames(players)
+        self.video_retired_players = self._unique_video_players(
+            [*self.video_retired_players, *players]
+        )
+        # The native stop/release work is already off the GUI thread.  Queue it
+        # immediately instead of waiting for the idle timer: under heavy Qt
+        # event traffic a delayed timer could leave a retired player out of the
+        # cleanup queue long enough for a later transition to reuse its frame.
+        # Keeping the queue bounded (one worker, one item per retired player)
+        # preserves the old coalescing/lifecycle guarantees without a visible
+        # transition stall.
+        self.video_cleanup_flush_pending = False
+        self.video_cleanup_idle_timer.stop()
+        self._flush_deferred_video_cleanup()
+
+    def _flush_deferred_video_cleanup(self):
+        self.video_cleanup_flush_pending = False
+        players = self.video_retired_players
+        self.video_retired_players = []
         self._queue_video_cleanup(players)
 
+    def retire_media_for_transition(self):
+        """Hide and retire active players without blocking the GUI thread.
+
+        The old surface is hidden immediately while its HWND remains attached
+        until the cleanup worker has completed stop.  This prevents stale native
+        frames and blocks libVLC from creating a fallback top-level window.
+        """
+        players = self._take_active_video_players()
+        self._defer_video_cleanup(players)
+
     def stop_media(self):
-        """Fully stop active players for explicit Stop or Explorer return."""
+        """Mute immediately, then stop asynchronously with valid hidden HWNDs."""
         players = self._take_active_video_players()
         players.extend(self.video_standby_players)
+        players.extend(self.video_retired_players)
         self.video_standby_players = []
-        for player in players:
-            # Detaching the native surface before stop substantially reduces
-            # the Windows/libVLC wait while preserving the no-stale-HWND fix.
-            self._quiesce_video_player(player)
+        self.video_retired_players = []
+        if self.vlc_instance is not None and self.vlc_instance not in self.video_retired_instances:
+            self.video_retired_instances.append(self.vlc_instance)
+        self.vlc_instance = None
+        self._queue_video_cleanup(players)
+        if not players and self.video_cleanup_inflight == 0:
+            self._release_retired_vlc_instances()
+
+    def _release_retired_vlc_instances(self):
+        instances = self.video_retired_instances
+        self.video_retired_instances = []
+        for instance in instances:
             try:
-                player.stop()
-            except Exception:
-                pass
-            try:
-                player.set_media(None)
-            except Exception:
-                pass
-            try:
-                player.release()
+                instance.release()
             except Exception:
                 pass
 
     def shutdown_video_cleanup(self):
+        # Once shutdown begins, native workers can finish in the background
+        # but their bookkeeping signals must not flood a closing Qt event loop.
+        # ``shutdown_for_close`` releases retired VLC instances after joining
+        # the workers, so no completion callback is needed on this path.
+        self.video_cleanup_signals.accept_results = False
+        self.video_start_signals.accept_results = False
+        if not self.video_start_closed:
+            self.video_start_closed = True
+            self.video_start_queue.put(None)
         if self.video_cleanup_closed:
             return
         self.video_cleanup_closed = True
         self.video_cleanup_queue.put(None)
+
+    def shutdown_for_close(self, timeout=1.5):
+        """Stop every native/Qt worker before the window is destroyed."""
+        if self.app_closing:
+            return
+        self.app_closing = True
+        for timer_name in (
+            "image_update_timer",
+            "video_timer",
+            "video_ready_timer",
+            "vlc_prewarm_timer",
+            "video_cleanup_idle_timer",
+            "viewer_preload_timer",
+            "webtoon_idle_timer",
+            "webtoon_build_timer",
+            "animated_image_timer",
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+        self.stop_webtoon_auto_scroll()
+        self.stop_media()
+        self.shutdown_video_cleanup()
+        for pool in (
+            getattr(self, "decode_pool", None),
+            getattr(self, "preload_decode_pool", None),
+            getattr(self, "animated_image_pool", None),
+        ):
+            if pool is not None:
+                pool.clear()
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while time.monotonic() < deadline:
+            unfinished = getattr(self.video_cleanup_queue, "unfinished_tasks", 0)
+            if unfinished <= 0 and not self.video_start_inflight:
+                break
+            time.sleep(0.01)
+        for pool in (
+            getattr(self, "decode_pool", None),
+            getattr(self, "preload_decode_pool", None),
+            getattr(self, "animated_image_pool", None),
+        ):
+            if pool is not None:
+                pool.waitForDone(max(0, int((deadline - time.monotonic()) * 1000)))
+        for thread in (
+            getattr(self, "video_start_thread", None),
+            getattr(self, "video_cleanup_thread", None),
+            getattr(self, "vlc_init_thread", None),
+            getattr(self, "video_player_create_thread", None),
+        ):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        self._release_retired_vlc_instances()
 
     def deactivate(self):
         self.cancel_pending_decodes()
@@ -3180,6 +5671,11 @@ class ViewerWindow(QMainWindow):
         self.preload_decode_pool.clear()
         self.decode_inflight.clear()
         self.stop_webtoon_auto_scroll()
+        if hasattr(self, "vlc_prewarm_timer"):
+            self.vlc_prewarm_timer.stop()
+        # Returning to the explorer releases standby players and the VLC
+        # instance too; keeping them attached to a hidden viewer wastes native
+        # memory and can leave an audio callback alive.
         self.stop_media()
         self.viewer_preload_queue = []
         self.viewer_preload_queued = set()
@@ -3217,11 +5713,12 @@ class ViewerWindow(QMainWindow):
             "fit_mode": self.fit_mode,
             "zoom_factor": self.zoom_factor,
             "rotation": self.rotation,
+            "max_frame_pixels": self.performance_policy.max_animated_frame_pixels,
         }
 
     def try_start_animated_image(self, label, path):
         path = Path(path)
-        if path.suffix.lower() not in (".gif", ".webp", ".apng"):
+        if not self.is_animated_image_path(path):
             return False
         key = id(label)
         existing = self.animated_image_states.get(key)
@@ -3250,6 +5747,8 @@ class ViewerWindow(QMainWindow):
             path,
             render_token,
             render_spec,
+            self.playback_rate,
+            archive_source=self.archive_sources.get(str(path)),
         )
         state = {
             "task": task,
@@ -3305,6 +5804,11 @@ class ViewerWindow(QMainWindow):
             self.animated_image_index = state["index"]
             self.animated_image_label = label
             self.animated_image_path = state["path"]
+            state["last_duration"] = int(result.get("duration", 80) or 80)
+            if bool(result.get("animated")):
+                self.current_has_animation = True
+                self.animated_rate_btn.show()
+                self.position_overlays()
         except RuntimeError:
             pass
         finally:
@@ -3357,7 +5861,13 @@ class ViewerWindow(QMainWindow):
                 self.try_start_animated_image(label, path)
                 continue
             label.setText("Loading…")
-            self.queue_viewer_decode(label, path, self.render_generation, priority=10)
+            self.queue_viewer_decode(
+                label,
+                path,
+                self.render_generation,
+                priority=10,
+                render_token=self.image_update_token,
+            )
 
     def start_visible_animations(self, generation=None):
         if generation is not None and generation != self.render_generation:
@@ -3416,6 +5926,7 @@ class ViewerWindow(QMainWindow):
             label.setText(path.name)
             self.webtoon_container_layout.addWidget(label, 0, Qt.AlignHCenter)
             self.labels.append((label, path))
+            self.webtoon_label_indices[id(label)] = len(self.labels) - 1
         if not self.webtoon_pending_paths:
             self.webtoon_build_timer.stop()
         QTimer.singleShot(0, self.update_webtoon_container_extent)
@@ -3428,18 +5939,17 @@ class ViewerWindow(QMainWindow):
         height = max(1, self.webtoon_container_layout.sizeHint().height())
         self.webtoon_container.setMinimumHeight(height)
         self.webtoon_container.updateGeometry()
+        self.webtoon_label_tops = [label.y() for label, _ in self.labels]
 
     def visible_webtoon_indices(self, margin=2):
         if not self.webtoon_scroll or not self.labels:
             return []
         viewport_top = self.webtoon_scroll.verticalScrollBar().value()
-        anchor = 0
-        for idx, (label, _) in enumerate(self.labels):
-            top = label.y()
-            bottom = top + max(1, label.height())
-            if bottom >= viewport_top:
-                anchor = idx
-                break
+        if len(self.webtoon_label_tops) != len(self.labels):
+            self.webtoon_label_tops = [label.y() for label, _ in self.labels]
+        anchor = bisect.bisect_left(self.webtoon_label_tops, viewport_top)
+        if anchor >= len(self.labels):
+            anchor = len(self.labels) - 1
         start = max(0, anchor - margin)
         end = min(len(self.labels) - 1, anchor + margin)
         return list(range(start, end + 1))
@@ -3448,7 +5958,13 @@ class ViewerWindow(QMainWindow):
         if generation is not None and generation != self.render_generation:
             return
         margin = 4 if self.webtoon_auto_scroll_active else 2
-        for idx in self.visible_webtoon_indices(margin=margin):
+        visible = set(
+            self.visible_webtoon_indices(
+                margin=max(margin, int(self.performance_policy.webtoon_lookahead) + 1)
+            )
+        )
+        self.release_offscreen_webtoon_pixmaps(visible)
+        for idx in visible:
             if idx in self.webtoon_loaded:
                 continue
             label, path = self.labels[idx]
@@ -3457,12 +5973,46 @@ class ViewerWindow(QMainWindow):
             label.setProperty("decode_generation", self.render_generation)
             self.queue_viewer_decode(label, path, self.render_generation, priority=10)
 
+    def release_offscreen_webtoon_pixmaps(self, visible=None):
+        if not self.labels or not self.is_webtoon_viewer_mode():
+            return
+        if visible is None:
+            visible = set(self.visible_webtoon_indices(
+                margin=max(2, int(self.performance_policy.webtoon_lookahead) + 1)
+            ))
+        for idx in list(self.webtoon_loaded):
+            if idx < 0 or idx >= len(self.labels):
+                self.webtoon_loaded.discard(idx)
+                continue
+            label, path = self.labels[idx]
+            if idx in visible:
+                continue
+            if not label.pixmap().isNull():
+                label.setPixmap(QPixmap())
+                label.setText(path.name)
+                label.setFixedSize(
+                    max(1, int(self.webtoon_target_width or WEBTOON_MIN_WIDTH)),
+                    120,
+                )
+                self.webtoon_loaded.discard(idx)
+
     def load_next_webtoon_idle_image(self):
         if self.viewer_mode not in ("webtoon", "webtoon_vertical") or not self.labels:
             self.webtoon_idle_timer.stop()
             return
+        if not self.performance_policy.idle_webtoon_preload:
+            self.webtoon_idle_timer.stop()
+            return
         self.update_webtoon_visible_images(self.render_generation)
-        visible_margin = 4 if self.webtoon_auto_scroll_active else 2
+        if any(str(path) in self.archive_sources for _, path in self.labels):
+            # ZIP browsing is intentionally demand-driven: visible members and
+            # the small nearby margin are decoded, never the entire archive.
+            self.webtoon_idle_timer.stop()
+            return
+        visible_margin = max(
+            4 if self.webtoon_auto_scroll_active else 2,
+            int(self.performance_policy.webtoon_lookahead) + 1,
+        )
         visible = set(self.visible_webtoon_indices(margin=visible_margin))
         for _ in range(len(self.labels)):
             idx = self.webtoon_idle_index % len(self.labels)
@@ -3492,7 +6042,10 @@ class ViewerWindow(QMainWindow):
             scale = min(area.width() / pix.width(), area.height() / pix.height())
             base = QSize(max(1, int(pix.width() * scale)), max(1, int(pix.height() * scale)))
         elif self.fit_mode == "manual":
-            base = pix.size()
+            # The decode request already includes the manual zoom factor.
+            # Applying it again here made each resize/zoom gesture compound
+            # the scale and caused large images to balloon in memory.
+            return pix.size()
         elif self.fit_mode == "actual":
             return pix.size()
         else:
@@ -3570,21 +6123,15 @@ class ViewerWindow(QMainWindow):
         )
         if not self.is_webtoon_viewer_mode():
             self.webtoon_auto_scroll_overlay.hide()
-        self.corner_filename_label.adjustSize()
-        self.corner_filename_label.setGeometry(margin, margin, self.corner_filename_label.sizeHint().width(), self.corner_filename_label.sizeHint().height())
-        self.corner_filename_label.setVisible(bool(self.current_file_name()) and not self.window().isFullScreen())
-        if getattr(self, "current_is_video", False):
-            hot_h = max(90, video_h + margin * 2)
-            self.input_layer.setGeometry(0, max(0, self.central.height() - hot_h), self.central.width(), hot_h)
-            self.input_layer.show()
-            self.input_layer.raise_()
-        else:
-            self.input_layer.hide()
+        # A transparent Qt widget raised above VLC's native Direct3D HWND is
+        # composed as an opaque black rectangle on Windows.  It used to cover
+        # exactly the lower 90 logical pixels of every video.  Keep it hidden;
+        # update_video_controls() polls the cursor for the same hover behavior.
+        self.input_layer.hide()
         self.viewer_overlay.raise_()
         self.rotation_overlay.raise_()
         self.video_overlay.raise_()
         self.webtoon_auto_scroll_overlay.raise_()
-        self.corner_filename_label.raise_()
 
     def show_overlays(self, pos=None):
         self.position_overlays()
@@ -3641,6 +6188,8 @@ class ViewerWindow(QMainWindow):
         self.exitRequested.emit()
 
     def keyPressEvent(self, event):
+        if self.handle_direct_zoom_key(event):
+            return
         if event.matches(QKeySequence.Copy):
             self.copy_current()
             return
@@ -3679,6 +6228,8 @@ class ViewerWindow(QMainWindow):
             except RuntimeError:
                 pass
         if event.type() == QEvent.KeyPress:
+            if self.handle_direct_zoom_key(event):
+                return True
             if event.matches(QKeySequence.Copy):
                 self.copy_current()
                 return True
@@ -3753,6 +6304,34 @@ class ViewerWindow(QMainWindow):
             return parent.main_stack.currentWidget() is self
         return self.isVisible()
 
+    def _video_lifecycle_busy(self):
+        now = time.monotonic()
+        active_starts = any(
+            now - float(started) < VIDEO_START_TIMEOUT_MS / 1000.0
+            for started in self.video_start_started.values()
+        )
+        # Cleanup owns retired VLC players on its worker thread.  It does not
+        # prevent the GUI from rendering the next image/video: a new video
+        # request simply waits for a fresh standby slot while cleanup drains.
+        # Treating cleanup as a navigation lock made rapid mixed-media moves
+        # appear stuck until an unrelated event arrived.
+        return bool(active_starts)
+
+    def _resume_pending_navigation(self):
+        if self._video_lifecycle_busy() or self.pending_navigation_index is None:
+            return False
+        target = max(0, min(len(self.items) - 1, int(self.pending_navigation_index)))
+        render_requested = bool(self.pending_render_requested)
+        render_reset = bool(self.pending_render_reset)
+        self.pending_navigation_index = None
+        self.pending_render_requested = False
+        self.pending_render_reset = False
+        if target == self.index and not render_requested:
+            return False
+        self.index = target
+        self.show_current(reset=render_reset or not self.zoom_locked)
+        return True
+
     def next_media(self):
         if self.viewer_mode in ("webtoon", "webtoon_vertical"):
             self.scroll_webtoon_page(1)
@@ -3760,7 +6339,11 @@ class ViewerWindow(QMainWindow):
         step = 1
         if self.step_mode in ("page", "manga_page"):
             step = {"double": 2, "triple": 3}.get(self.viewer_mode, 1)
-        new_index = min(len(self.items) - 1, self.index + step)
+        base_index = self.pending_navigation_index if self.pending_navigation_index is not None else self.index
+        new_index = min(len(self.items) - 1, base_index + step)
+        self.pending_navigation_index = None
+        self.pending_render_requested = False
+        self.pending_render_reset = False
         if new_index == self.index:
             return
         self.index = new_index
@@ -3775,7 +6358,12 @@ class ViewerWindow(QMainWindow):
         step = 1
         if self.step_mode in ("page", "manga_page"):
             step = {"double": 2, "triple": 3}.get(self.viewer_mode, 1)
-        self.index = (self.index + step) % len(self.items)
+        base_index = self.pending_navigation_index if self.pending_navigation_index is not None else self.index
+        new_index = (base_index + step) % len(self.items)
+        self.pending_navigation_index = None
+        self.pending_render_requested = False
+        self.pending_render_reset = False
+        self.index = new_index
         self.show_current(reset=not self.zoom_locked)
 
     def handle_space(self):
@@ -3879,7 +6467,11 @@ class ViewerWindow(QMainWindow):
         step = 1
         if self.step_mode in ("page", "manga_page"):
             step = {"double": 2, "triple": 3}.get(self.viewer_mode, 1)
-        new_index = max(0, self.index - step)
+        base_index = self.pending_navigation_index if self.pending_navigation_index is not None else self.index
+        new_index = max(0, base_index - step)
+        self.pending_navigation_index = None
+        self.pending_render_requested = False
+        self.pending_render_reset = False
         if new_index == self.index:
             return
         self.index = new_index
@@ -3888,6 +6480,9 @@ class ViewerWindow(QMainWindow):
     def first_media(self):
         if self.index == 0:
             return
+        self.pending_navigation_index = None
+        self.pending_render_requested = False
+        self.pending_render_reset = False
         self.index = 0
         self.show_current(reset=not self.zoom_locked)
 
@@ -3895,6 +6490,9 @@ class ViewerWindow(QMainWindow):
         last_index = max(0, len(self.items) - 1)
         if self.index == last_index:
             return
+        self.pending_navigation_index = None
+        self.pending_render_requested = False
+        self.pending_render_reset = False
         self.index = last_index
         self.show_current(reset=not self.zoom_locked)
 
@@ -3973,29 +6571,49 @@ class ViewerWindow(QMainWindow):
             return max(0.05, min(10.0, display_pixmap.width() / source_size.width()))
         return max(0.05, min(10.0, self.zoom_factor))
 
+    def handle_direct_zoom_key(self, event):
+        """Handle physical +/- keys consistently, including the keypad."""
+        if event is None or event.type() != QEvent.KeyPress:
+            return False
+        modifiers = event.modifiers()
+        blocked = Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
+        if modifiers & blocked:
+            return False
+        key = event.key()
+        text = event.text()
+        if key == Qt.Key_Plus or text == "+":
+            self.zoom_in()
+            event.accept()
+            return True
+        if key == Qt.Key_Minus or text in ("-", "−"):
+            self.zoom_out()
+            event.accept()
+            return True
+        return False
+
     def zoom_in(self):
         self.force_manual_for_zoom()
-        self.zoom_factor *= 1.15
+        self.zoom_factor = min(10.0, self.zoom_factor * 1.15)
         self.update_manual_zoom_text()
         self.schedule_image_update()
 
     def zoom_out(self):
         self.force_manual_for_zoom()
-        self.zoom_factor /= 1.15
+        self.zoom_factor = max(0.05, self.zoom_factor / 1.15)
         self.update_manual_zoom_text()
         self.schedule_image_update()
 
     def rotate_right(self):
         self.rotation = (self.rotation + 90) % 360
-        self.update_image_labels()
+        self.schedule_image_update()
 
     def rotate_left(self):
         self.rotation = (self.rotation - 90) % 360
-        self.update_image_labels()
+        self.schedule_image_update()
 
     def reset_rotation(self):
         self.rotation = 0
-        self.update_image_labels()
+        self.schedule_image_update()
 
     def set_fit_mode(self, mode):
         self.fit_mode = mode
@@ -4047,29 +6665,48 @@ class ViewerWindow(QMainWindow):
         if not self.media_player:
             return
         try:
-            if self.video_path is not None and (self.video_stopped_by_user or self.video_finished):
-                media = self.vlc_instance.media_new(str(self.video_path))
-                self.media_player.set_media(media)
-                self.media_player.set_hwnd(int(self.video_frame.winId()))
+            restarting = self.video_stopped_by_user or self.video_finished
+            primary_token = None
+            primary_state = None
+            for token, state in self.video_slot_states.items():
+                if state.get("primary") and state.get("player") is self.media_player:
+                    primary_token = token
+                    primary_state = state
+                    break
+            if restarting and primary_token is not None:
+                self._restart_video_slot(primary_token, force=True)
+                return
             self.video_finished = False
             self.video_stopped_by_user = False
             self.media_player.set_time(0)
             self.media_player.play()
+            self.apply_video_playback_rate(self.media_player)
             self.media_player.audio_set_volume(self.volume_slider.value())
-            for state in self.video_slot_states.values():
-                if state.get("primary") and state.get("player") is self.media_player:
-                    state["ended"] = False
-                    state["restarting"] = False
+            if primary_state is not None:
+                primary_state["ended"] = False
+                primary_state["restarting"] = False
             self.video_timer.start(250)
         except Exception:
             pass
 
     def set_video_volume(self, value):
-        if self.media_player:
+        players = [self.media_player, *self.extra_media_players]
+        for player in players:
+            if player is None:
+                continue
+            lock = self.video_player_locks.setdefault(id(player), threading.RLock())
+            if not lock.acquire(timeout=0.01):
+                continue
             try:
-                self.media_player.audio_set_volume(value)
+                player.audio_set_volume(value)
+                # Only the primary slot is audible.  Keeping the secondary
+                # players muted prevents audio from a previous page leaking
+                # while the next video is still being prepared.
+                player.audio_set_mute(player is not self.media_player)
             except Exception:
                 pass
+            finally:
+                lock.release()
 
     def begin_video_seek(self):
         self._seeking_video = True
@@ -4097,8 +6734,29 @@ class ViewerWindow(QMainWindow):
             return 0
 
     def update_video_controls(self):
-        if not self.media_player or self._seeking_video:
+        if not self.media_player or self._seeking_video or self._video_lifecycle_busy():
             return
+        if getattr(self, "current_is_video", False):
+            cursor_pos = self.central.mapFromGlobal(QCursor.pos())
+            if self.central.rect().contains(cursor_pos):
+                self.show_overlays(cursor_pos)
+        ended_states = set()
+        if vlc is not None:
+            ended_states = {
+                getattr(vlc.State, "Ended", None),
+                getattr(vlc.State, "Stopped", None),
+                getattr(vlc.State, "Error", None),
+            }
+            ended_states.discard(None)
+        for token, state in list(self.video_slot_states.items()):
+            if state.get("ended") or state.get("restarting"):
+                continue
+            try:
+                player_state = state["player"].get_state()
+            except Exception:
+                continue
+            if player_state in ended_states:
+                self._mark_video_ended(token)
         try:
             length = max(0, int(self.media_player.get_length()))
             current = max(0, int(self.media_player.get_time()))
@@ -4121,9 +6779,7 @@ class ViewerWindow(QMainWindow):
             top.showFullScreen()
 
     def closeEvent(self, event):
-        self.stop_webtoon_auto_scroll()
-        self.stop_media()
-        self.shutdown_video_cleanup()
+        self.shutdown_for_close()
         if self._app_filter_installed:
             QApplication.instance().removeEventFilter(self)
             self._app_filter_installed = False
@@ -4226,6 +6882,7 @@ class MainWindow(QMainWindow):
     def __init__(self, startup_path=None):
         super().__init__()
         self.settings = load_settings()
+        self.performance_policy = performance_policy_for(self.settings)
         self.closing = False
         startup_path = Path(startup_path) if startup_path else None
         self.startup_media_path = None
@@ -4249,17 +6906,35 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.media_paths = []
         self.viewer = None
+        self.vlc_prewarm_inflight = False
+        self.vlc_prewarm_task = None
+        self.vlc_prewarm_thread = None
+        self.vlc_prewarm_instance = None
+        self.vlc_prewarm_bundles = []
         self.explorer_geometry_before_viewer = None
         self.history = []
         self.history_index = -1
         self.entries = []
         self.archive_tempdirs = []
+        self.archive_sources_by_root = {}
+        self.archive_root_by_path = {}
+        self.archive_context_last_used = {}
+        self.archive_contexts = {}
+        self.archive_member_sources = {}
+        self.archive_sessions = []
         self.archive_pool = QThreadPool(self)
         self.archive_pool.setMaxThreadCount(1)
         self.archive_task_refs = set()
+        self.archive_navigation_generation = 0
+        self.navigation_position_serial = 0
+        self.pending_navigation_position = None
+        self.navigation_position_timer = QTimer(self)
+        self.navigation_position_timer.setInterval(35)
+        self.navigation_position_timer.timeout.connect(self.apply_pending_navigation_position)
         self.display_path = str(self.current_folder)
         self.virtual_unc_server = ""
         self.virtual_entries = []
+        self.unc_generation = 0
         self.folder_cache = {}
         self.current_snapshot_key = ""
         self.explorer_dirty = False
@@ -4268,6 +6943,7 @@ class MainWindow(QMainWindow):
         self.folder_scan_pool.setMaxThreadCount(1)
         self.folder_scan_pool.setThreadPriority(QThread.LowPriority)
         self.folder_scan_task_refs = set()
+        self.unc_share_task_refs = set()
         self.thumbnail_cache = {}
         self.thumbnail_cache_meta = {}
         self.thumbnail_cache_order = []
@@ -4278,14 +6954,25 @@ class MainWindow(QMainWindow):
         self.thumbnail_paused = False
         self.thumbnail_pool = QThreadPool(self)
         self.thumbnail_pool.setThreadPriority(QThread.IdlePriority)
+        self.file_op_pool = QThreadPool(self)
+        self.file_op_pool.setMaxThreadCount(1)
+        self.file_op_pool.setThreadPriority(QThread.LowPriority)
+        self.file_op_task_refs = set()
         self.thumbnail_idle_cursor = 0
         self.thumbnail_task_refs = set()
-        self.thumbnail_queue = []
+        self.thumbnail_queue = deque()
         self.thumbnail_queue_set = set()
         self.thumbnail_cycle_started = False
         self.generic_media_icon = None
         self.entry_by_path = {}
         self.view_render_keys = {"list": None, "details": None}
+        self.explorer_render_pending = False
+        self._list_render_entries = []
+        self._list_render_index = 0
+        self._list_render_token = 0
+        self._list_render_lightweight = True
+        self._list_render_key = None
+        self._list_render_scroll = 0
         self.list_item_by_path = {}
         self.detail_item_by_path = {}
         self.cut_clipboard_paths = set()
@@ -4358,6 +7045,7 @@ class MainWindow(QMainWindow):
         self.tree.viewport().installEventFilter(self)
 
         self.preview = PreviewPanel()
+        self.preview.source_resolver = self.archive_source_for_path
         self.quick_paths = QListWidget()
         self.quick_paths.setContextMenuPolicy(Qt.CustomContextMenu)
         self.quick_paths.customContextMenuRequested.connect(self.quick_paths_menu)
@@ -4507,6 +7195,11 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self):
         light = self.settings.get("theme", "dark") == "light"
+        self._dark_theme = not light
+        if hasattr(self, "list"):
+            self.list.set_dark_theme(self._dark_theme)
+        if hasattr(self, "details"):
+            self.details._dark_theme = self._dark_theme
         colors = {
             "base": "#fffafd" if light else "#17161d",
             "surface": "#ffffff" if light else "#211f29",
@@ -4546,9 +7239,11 @@ class MainWindow(QMainWindow):
             }}
             QTreeView {{ font-size: 8pt; }}
             QTreeView::item {{ padding: 2px 3px; }}
-            QTreeView::item, QListWidget::item, QTableWidget::item {{
+            QTreeView::item {{
                 border: none; padding: 4px; border-radius: 5px;
             }}
+            QListWidget::item {{ padding: 4px; }}
+            QTableWidget::item {{ padding: 4px; }}
             QTreeView::item:hover, QListWidget::item:hover, QTableWidget::item:hover {{
                 background: {colors['hover']};
             }}
@@ -4975,6 +7670,25 @@ class MainWindow(QMainWindow):
         except OSError:
             return (0, 0)
 
+    def _store_folder_snapshot(self, key, snapshot):
+        key = str(key)
+        self.folder_cache[key] = snapshot
+        if key in getattr(self, "archive_sources_by_root", {}):
+            return
+        limit = 12 if self.performance_policy.low_spec else 32
+        while len(self.folder_cache) > limit:
+            removable = next(
+                (
+                    candidate
+                    for candidate in self.folder_cache
+                    if candidate not in (key, self.current_snapshot_key)
+                ),
+                None,
+            )
+            if removable is None:
+                break
+            self.folder_cache.pop(removable, None)
+
     def scan_folder_entries(self, folder, cancel_check=None):
         entries = []
         with os.scandir(folder) as iterator:
@@ -5007,7 +7721,7 @@ class MainWindow(QMainWindow):
         if not force and cached is not None and cached.signature == signature:
             return list(cached.entries), key, False
         entries = self.scan_folder_entries(folder)
-        self.folder_cache[key] = FolderSnapshot(folder, entries, signature)
+        self._store_folder_snapshot(key, FolderSnapshot(folder, entries, signature))
         return list(entries), key, True
 
     def invalidate_folder_cache(self, folder=None):
@@ -5034,59 +7748,49 @@ class MainWindow(QMainWindow):
         self.path_edit.setText(self.display_path)
         self.watch_current_folder()
         self.pending_tree_path = str(self.current_folder)
-        self.tree_sync_timer.start(180)
+        # A direct file open enters the viewer immediately.  QFileSystemModel
+        # path resolution is deferred until the explorer is actually visible;
+        # doing this behind the viewer caused intermittent cold-start stalls.
+        self.tree_sync_timer.stop()
         startup = str(self.startup_media_path)
-        self.media_paths = [startup]
+        snapshot_key = os.path.normcase(os.path.abspath(str(self.current_folder)))
+        context_changed = snapshot_key != self.current_snapshot_key
+        if context_changed:
+            # A direct file-open must atomically invalidate the previous
+            # explorer folder.  Otherwise exit_viewer_mode() sees non-empty
+            # stale rows and restores them under the new address/tab path.
+            self.folder_scan_generation += 1
+            for task in list(self.folder_scan_task_refs):
+                task.cancel()
+            self.folder_scan_pool.clear()
+            self.pause_thumbnail_work(cancel_pending=True)
+            self.entries = []
+            self.entry_by_path = {}
+            self.list.clear()
+            self.details.clear_entries()
+            self.list_item_by_path = {}
+            self.detail_item_by_path = {}
+            self.view_render_keys["list"] = None
+            self.view_render_keys["details"] = None
+            self.explorer_render_pending = True
+            self.current_snapshot_key = snapshot_key
+            self.explorer_dirty = False
+            self.media_paths = [startup]
+        elif startup not in self.media_paths:
+            self.media_paths.insert(0, startup)
+        self.startup_media_scan_target = startup
         self.update_current_tab()
+        return context_changed
 
     def start_startup_media_scan(self):
-        if not self.startup_media_path:
-            return
-        if self.startup_media_scan_timer.isActive():
-            self.startup_media_scan_timer.stop()
-        try:
-            self.startup_media_scan_iter = iter(Path(self.current_folder).iterdir())
-        except (PermissionError, FileNotFoundError, OSError):
-            self.startup_media_scan_iter = None
-            return
-        self.startup_media_scan_paths = []
-        self.startup_media_scan_seen = set()
-        self.startup_media_scan_target = str(self.startup_media_path)
-        self.startup_media_scan_timer.start()
+        """Use the one cancellable background folder scan for direct opens."""
+        if self.startup_media_path:
+            self.populate_list(lightweight=True, force=False, preserve_existing=True)
 
     def process_startup_media_scan(self):
-        if self.startup_media_scan_iter is None:
-            self.startup_media_scan_timer.stop()
-            return
-        changed = False
-        finished = False
-        count = 0
-        started = time.monotonic()
-        while count < 160 and time.monotonic() - started < 0.008:
-            try:
-                child = next(self.startup_media_scan_iter)
-            except StopIteration:
-                finished = True
-                break
-            except (PermissionError, FileNotFoundError, OSError):
-                continue
-            count += 1
-            try:
-                if not child.is_file() or not is_media(child):
-                    continue
-            except OSError:
-                continue
-            path_text = str(child)
-            if path_text in self.startup_media_scan_seen:
-                continue
-            self.startup_media_scan_seen.add(path_text)
-            self.startup_media_scan_paths.append(path_text)
-            changed = True
-        if changed or finished:
-            self.apply_startup_media_scan_paths(final=finished)
-        if finished:
-            self.startup_media_scan_timer.stop()
-            self.startup_media_scan_iter = None
+        # Kept as a no-op for old queued timer events during an in-place update.
+        self.startup_media_scan_timer.stop()
+        self.startup_media_scan_iter = None
 
     def apply_startup_media_scan_paths(self, final=False):
         target = self.startup_media_scan_target or (str(self.startup_media_path) if self.startup_media_path else "")
@@ -5095,22 +7799,50 @@ class MainWindow(QMainWindow):
         paths = list(self.startup_media_scan_paths)
         if target not in paths:
             paths.insert(0, target)
-        if paths == self.media_paths:
-            return
+        self.apply_media_paths_to_active_viewer(paths, target=target, final=final)
+
+    def apply_media_paths_to_active_viewer(self, paths, target=None, final=False):
+        paths = list(dict.fromkeys(str(path) for path in paths if is_media(path)))
+        target = str(target or "")
+        if target and target not in paths:
+            paths.insert(0, target)
         current = target
+        previous_item_count = 0
+        previous_grid_count = 0
+        previous_viewer_paths = []
         if self.viewer and self.viewer.items:
+            previous_item_count = len(self.viewer.items)
+            previous_viewer_paths = [str(path) for path in self.viewer.items]
             current = str(self.viewer.items[self.viewer.index])
+            try:
+                previous_grid_count = int(self.viewer.grid.count())
+            except (AttributeError, RuntimeError):
+                previous_grid_count = 0
+        paths_changed = paths != self.media_paths
         self.media_paths = paths
         if not self.viewer:
             return
         self.viewer.items = [Path(path) for path in self.media_paths if is_media(path)]
         if not self.viewer.items:
             return
-        if current in self.media_paths:
-            self.viewer.index = self.media_paths.index(current)
+        current_key = self.normalized_location_path(current) if current else ""
+        path_index = {
+            self.normalized_location_path(path): index
+            for index, path in enumerate(self.media_paths)
+        }
+        if current_key in path_index:
+            self.viewer.index = path_index[current_key]
         else:
             self.viewer.index = min(self.viewer.index, len(self.viewer.items) - 1)
-        if final and self.viewer.viewer_mode in ("webtoon", "webtoon_vertical"):
+        viewer_paths_changed = previous_viewer_paths != [str(path) for path in self.viewer.items]
+        provisional_group_needs_refresh = False
+        if final and viewer_paths_changed and previous_item_count <= 1:
+            if self.viewer.viewer_mode in ("double", "triple"):
+                provisional_group_needs_refresh = len(self.viewer.current_group()) > previous_grid_count
+        if final and viewer_paths_changed and (
+            self.viewer.viewer_mode in ("webtoon", "webtoon_vertical")
+            or provisional_group_needs_refresh
+        ):
             self.viewer.show_current(reset=False)
         else:
             title_name = self.viewer.active_display_path.name if self.viewer.active_display_path else self.viewer.items[self.viewer.index].name
@@ -5125,12 +7857,30 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-    def load_folder(self, folder, add_history=True, display_path=None, force=False, sync_tree=True):
+    def load_folder(
+        self,
+        folder,
+        add_history=True,
+        display_path=None,
+        force=False,
+        sync_tree=True,
+        navigation=None,
+    ):
+        if display_path is None or "::" not in str(display_path):
+            self.archive_navigation_generation += 1
+        self.unc_generation += 1
+        for previous_task in list(self.unc_share_task_refs):
+            previous_task.cancel()
+        self.unc_share_task_refs.clear()
         folder = Path(folder)
         self.virtual_unc_server = ""
         self.virtual_entries = []
         self.current_folder = folder
+        archive_root_key = self.archive_root_by_path.get(self.normalized_location_path(folder))
+        if archive_root_key:
+            self.archive_context_last_used[archive_root_key] = time.monotonic()
         self.display_path = display_path or str(folder)
+        self.prepare_navigation_position(navigation, folder)
         if add_history:
             self.history = self.history[: self.history_index + 1]
             self.history.append(self.display_path)
@@ -5150,9 +7900,92 @@ class MainWindow(QMainWindow):
         self.update_current_tab()
         return True
 
+    def prepare_navigation_position(self, navigation, folder=None):
+        self.navigation_position_serial += 1
+        self.navigation_position_timer.stop()
+        self.pending_navigation_position = None
+        if not navigation:
+            return
+        mode = str(navigation.get("mode") or "").lower()
+        if mode not in ("top", "anchor"):
+            return
+        if folder is None and self.virtual_unc_server:
+            location_key = f"unc:{self.virtual_unc_server.lower()}"
+        else:
+            folder = Path(folder if folder is not None else self.current_folder)
+            location_key = os.path.normcase(os.path.abspath(str(folder)))
+        self.pending_navigation_position = {
+            "serial": self.navigation_position_serial,
+            "folder_key": location_key,
+            "mode": mode,
+            "anchor": str(navigation.get("anchor") or ""),
+            "deadline": time.monotonic() + 2.5,
+            "settle_until": 0.0,
+        }
+        self.navigation_position_timer.start()
+
+    def reset_explorer_list_position(self):
+        self.list.clearSelection()
+        self.details.clearSelection()
+        self.list.selectionModel().clearCurrentIndex()
+        self.details.selectionModel().clearCurrentIndex()
+        self.list.scrollToTop()
+        self.details.scrollToTop()
+
+    def apply_pending_navigation_position(self):
+        state = self.pending_navigation_position
+        if not state:
+            self.navigation_position_timer.stop()
+            return
+        current_key = (
+            f"unc:{self.virtual_unc_server.lower()}"
+            if self.virtual_unc_server
+            else os.path.normcase(os.path.abspath(str(self.current_folder)))
+        )
+        if current_key != state["folder_key"]:
+            self.pending_navigation_position = None
+            self.navigation_position_timer.stop()
+            return
+
+        now = time.monotonic()
+        mode = state["mode"]
+        applied = False
+        if mode == "top":
+            self.reset_explorer_list_position()
+            applied = True
+        else:
+            anchor = state["anchor"]
+            if self.view_combo.currentText() == "details":
+                item = self.detail_item_by_path.get(anchor)
+                if item is not None:
+                    self.details.selectRow(item.row())
+                    self.details.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                    applied = True
+            else:
+                item = self.list_item_by_path.get(anchor)
+                if item is not None:
+                    self.list.setCurrentItem(item)
+                    self.list.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                    applied = True
+
+        if applied:
+            if not state["settle_until"]:
+                state["settle_until"] = now + 0.55
+            if now >= state["settle_until"]:
+                self.pending_navigation_position = None
+                self.navigation_position_timer.stop()
+            return
+
+        if now >= state["deadline"]:
+            self.reset_explorer_list_position()
+            self.pending_navigation_position = None
+            self.navigation_position_timer.stop()
+
     def sync_tree_selection(self):
         path = self.pending_tree_path
         if not path or path != str(self.current_folder):
+            return
+        if self.viewer is not None and self.main_stack.currentWidget() is self.viewer:
             return
         current = self.tree.currentIndex()
         if current.isValid() and os.path.normcase(self.tree_model.filePath(current)) == os.path.normcase(path):
@@ -5179,6 +8012,10 @@ class MainWindow(QMainWindow):
             self.view_render_keys["list"] = None
             self.view_render_keys["details"] = None
         if self.virtual_unc_server:
+            self.folder_scan_generation += 1
+            for previous_task in list(self.folder_scan_task_refs):
+                previous_task.cancel()
+            self.folder_scan_pool.clear()
             entries = [MediaItem(path, True, label) for label, path in self.virtual_entries]
             self.entries = entries
             self.media_paths = []
@@ -5224,8 +8061,68 @@ class MainWindow(QMainWindow):
             return
         snapshot_key = os.path.normcase(os.path.abspath(str(folder)))
         signature = tuple(result.get("signature_after") or self.folder_signature(folder))
-        self.folder_cache[snapshot_key] = FolderSnapshot(Path(folder), list(entries), signature)
+        self._store_folder_snapshot(
+            snapshot_key,
+            FolderSnapshot(Path(folder), list(entries), signature),
+        )
         self.apply_folder_entries(list(entries), snapshot_key, lightweight=lightweight)
+
+    def schedule_vlc_prewarm(self, entries=None):
+        """Start cold libVLC plugin scanning while the explorer is visible."""
+        if (
+            vlc is None
+            or self.closing
+            or self.vlc_prewarm_inflight
+            or self.vlc_prewarm_instance is not None
+            or (self.viewer is not None and self.main_stack.currentWidget() is self.viewer)
+        ):
+            return
+        entries = self.entries if entries is None else entries
+        if not any(not entry.is_dir and is_video(entry.path) for entry in entries):
+            return
+        self.vlc_prewarm_inflight = True
+        task = VlcInitTask(vlc)
+        self.vlc_prewarm_task = task
+        task.signals.finished.connect(self._vlc_prewarm_finished, Qt.QueuedConnection)
+        self.vlc_prewarm_thread = threading.Thread(
+            target=task.run,
+            name="PhotoViewer-VLC-Prewarm",
+            daemon=True,
+        )
+        self.vlc_prewarm_thread.start()
+
+    def _vlc_prewarm_finished(self, instance, bundles, error, task):
+        if task is not self.vlc_prewarm_task:
+            return
+        self.vlc_prewarm_inflight = False
+        self.vlc_prewarm_task = None
+        if self.closing or error or instance is None:
+            for _player_instance, player in list(bundles or []):
+                try:
+                    player.release()
+                except Exception:
+                    pass
+            try:
+                if instance is not None:
+                    instance.release()
+            except Exception:
+                pass
+            return
+        viewer = self.viewer
+        viewer_active = viewer is not None and self.main_stack.currentWidget() is viewer
+        if not viewer_active:
+            self.vlc_prewarm_instance = instance
+            self.vlc_prewarm_bundles = list(bundles or [])
+            return
+        viewer.vlc_instance = instance
+        viewer.vlc_init_inflight = False
+        viewer.vlc_init_error = ""
+        players = [player for _player_instance, player in bundles or []]
+        for player_instance, player in bundles or []:
+            viewer.video_player_instances[id(player)] = player_instance
+            viewer._configure_media_player(player)
+        viewer.video_standby_players.extend(players)
+        viewer._dispatch_pending_video_requests()
 
     def apply_folder_entries(self, entries, snapshot_key, lightweight=True):
         self.current_snapshot_key = snapshot_key
@@ -5240,10 +8137,34 @@ class MainWindow(QMainWindow):
         self.entries = entries
         self.entry_by_path = {str(entry.path): entry for entry in entries}
         self.media_paths = [str(e.path) for e in entries if not e.is_dir and is_media(e.path)]
-        self.render_entries(entries, lightweight=lightweight)
+        self.schedule_vlc_prewarm(entries)
+        viewer_active = self.viewer is not None and self.main_stack.currentWidget() is self.viewer
+        if viewer_active:
+            # Do not build thousands of hidden QList/QTable widgets behind an
+            # active viewer.  The cache and sibling media list are complete;
+            # one render is performed only when returning to the explorer.
+            self.explorer_render_pending = True
+        else:
+            self.render_entries(entries, lightweight=lightweight)
+            self.explorer_render_pending = False
+        if (
+            self.viewer is not None
+            and self.main_stack.currentWidget() is self.viewer
+            and self.startup_media_path is not None
+            and Path(self.startup_media_path).parent == Path(self.current_folder)
+        ):
+            self.apply_media_paths_to_active_viewer(
+                self.media_paths,
+                target=str(self.startup_media_path),
+                final=True,
+            )
 
     def render_entries(self, entries=None, lightweight=True, preserve_scroll=False):
         entries = list(self.entries if entries is None else entries)
+        self._list_render_token += 1
+        render_token = self._list_render_token
+        self._list_render_entries = []
+        self._list_render_index = 0
         self.entry_by_path = {str(entry.path): entry for entry in entries}
         view_name = "details" if self.view_combo.currentText() == "details" else "list"
         render_key = self.current_render_key(entries)
@@ -5270,24 +8191,77 @@ class MainWindow(QMainWindow):
         else:
             self.list.clear()
             self.list_item_by_path = {}
+            if len(entries) > 1500:
+                # Keep the first paint bounded for very large folders.  Rows
+                # are appended in short event-loop slices so the window can
+                # still receive input and thumbnails can prioritize visible
+                # rows while the remainder is built.
+                self._list_render_entries = entries
+                self._list_render_index = 0
+                self._list_render_token = render_token
+                self._list_render_lightweight = lightweight
+                self._list_render_key = render_key
+                self._list_render_scroll = list_scroll
+                self.view_render_keys[view_name] = None
+                self.list.setUpdatesEnabled(True)
+                self.details.setUpdatesEnabled(True)
+                self._append_list_render_chunk(render_token)
+                return
             for entry in entries:
-                item = QListWidgetItem(entry.display_name)
-                item.setData(Qt.UserRole, str(entry.path))
-                item.setToolTip(str(entry.path))
-                item.setIcon(self.entry_icon(entry, lightweight=lightweight))
-                color = type_color(entry.path, entry.is_dir)
-                if color is not None:
-                    item.setBackground(color)
-                self.list.addItem(item)
-                self.list_item_by_path[str(entry.path)] = item
+                self._append_list_item(entry, lightweight)
         self.view_render_keys[view_name] = render_key
         self.list.setUpdatesEnabled(True)
         self.details.setUpdatesEnabled(True)
         if preserve_scroll:
             self.list.verticalScrollBar().setValue(list_scroll)
             self.details.verticalScrollBar().setValue(details_scroll)
+        else:
+            # Clearing and immediately repopulating a cached folder can leave
+            # Qt's old numeric scrollbar value alive.  Force a deterministic
+            # baseline; navigation-specific positioning is applied afterward.
+            self.reset_explorer_list_position()
         self.update_command_buttons()
         if lightweight:
+            self.thumbnail_paused = False
+            self.start_thumbnail_loading()
+
+    def _append_list_item(self, entry, lightweight=True):
+        item = QListWidgetItem(entry.display_name)
+        item.setData(Qt.UserRole, str(entry.path))
+        item.setToolTip(str(entry.path))
+        item.setIcon(self.entry_icon(entry, lightweight=lightweight))
+        color = (
+            type_color(entry.path, entry.is_dir, dark_theme=self._dark_theme)
+            if self.list.viewMode() == QListWidget.ListMode
+            else None
+        )
+        if color is not None:
+            item.setBackground(color)
+        self.list.addItem(item)
+        self.list_item_by_path[str(entry.path)] = item
+
+    def _append_list_render_chunk(self, token=None):
+        token = self._list_render_token if token is None else int(token)
+        if token != self._list_render_token or self.closing:
+            return
+        entries = self._list_render_entries
+        if not entries:
+            self.view_render_keys["list"] = self._list_render_key
+            return
+        start = self._list_render_index
+        end = min(len(entries), start + 256)
+        self.list.setUpdatesEnabled(False)
+        for entry in entries[start:end]:
+            self._append_list_item(entry, self._list_render_lightweight)
+        self._list_render_index = end
+        self.list.setUpdatesEnabled(True)
+        if end < len(entries):
+            QTimer.singleShot(0, lambda current=token: self._append_list_render_chunk(current))
+            return
+        self.view_render_keys["list"] = self._list_render_key
+        self.list.verticalScrollBar().setValue(self._list_render_scroll)
+        self.update_command_buttons()
+        if self._list_render_lightweight:
             self.thumbnail_paused = False
             self.start_thumbnail_loading()
 
@@ -5310,15 +8284,18 @@ class MainWindow(QMainWindow):
             name = "balanced"
             self.settings["performance_profile"] = name
         profile = PERFORMANCE_PROFILES[name]
+        self.performance_policy = performance_policy_for(self.settings)
         self.performance_profile = dict(profile)
         self.thumbnail_start_ms = int(profile["thumbnail_start_ms"])
         self.thumbnail_gap_ms = int(profile["thumbnail_gap_ms"])
-        self.thumbnail_pool.setMaxThreadCount(int(profile["thumbnail_workers"]))
+        self.thumbnail_pool.setMaxThreadCount(int(self.performance_policy.thumbnail_workers))
         self.thumbnail_pool.setThreadPriority(QThread.IdlePriority)
+        if self.viewer is not None:
+            self.viewer.apply_performance_policy(self.performance_policy)
         if hasattr(self, "thumbnail_timer") and self.thumbnail_timer.isActive():
             self.thumbnail_timer.stop()
             if self.thumbnail_queue and not self.thumbnail_paused:
-                self.thumbnail_timer.start(self.thumbnail_gap_ms)
+                self.thumbnail_timer.start(self.performance_policy.thumbnail_gap_ms)
 
     def schedule_settings_save(self):
         self.settings_save_timer.start()
@@ -5328,6 +8305,7 @@ class MainWindow(QMainWindow):
         folder_key = self.current_snapshot_key or os.path.normcase(os.path.abspath(str(self.current_folder)))
         return (
             folder_key,
+            self.settings.get("theme", "dark"),
             tuple((str(entry.path), int(entry.size), float(entry.mtime)) for entry in entries),
         )
 
@@ -5349,7 +8327,7 @@ class MainWindow(QMainWindow):
                 task.cancel()
             self.thumbnail_pool.clear()
             self.thumbnail_inflight.clear()
-            self.thumbnail_queue = []
+            self.thumbnail_queue = deque()
             self.thumbnail_queue_set.clear()
             self.thumbnail_cycle_started = False
 
@@ -5372,6 +8350,7 @@ class MainWindow(QMainWindow):
             canvas_size=(192, 192),
             video_shell=is_video(entry.path),
             thread_priority=QThread.IdlePriority,
+            archive_source=self.archive_source_for_path(path),
         )
         self.thumbnail_inflight.add(path)
         self.thumbnail_task_refs.add(task)
@@ -5398,8 +8377,14 @@ class MainWindow(QMainWindow):
             start = max(0, min(positions) - len(priority_paths))
             end = min(len(media_order), max(positions) + span + 1)
             priority_paths.extend(path for path in media_order[start:end] if path not in priority_paths)
-        ordered = list(dict.fromkeys(priority_paths + self.thumbnail_queue + media_order))
-        self.thumbnail_queue = [
+        archive_context = self.current_snapshot_key in self.archive_sources_by_root
+        if archive_context:
+            # A remote archive must remain demand-driven.  Loading all members
+            # in the idle tail would silently download the complete ZIP.
+            ordered = list(dict.fromkeys(priority_paths + list(self.thumbnail_queue)))
+        else:
+            ordered = list(dict.fromkeys(priority_paths + list(self.thumbnail_queue) + media_order))
+        self.thumbnail_queue = deque(
             path
             for path in ordered
             if path not in self.thumbnail_inflight
@@ -5411,7 +8396,7 @@ class MainWindow(QMainWindow):
                     self.entry_by_path.get(path).mtime if self.entry_by_path.get(path) else -1,
                 )
             )
-        ]
+        )
         self.thumbnail_queue_set = set(self.thumbnail_queue)
         if self.thumbnail_queue and not self.thumbnail_timer.isActive():
             delay = self.thumbnail_gap_ms if self.thumbnail_cycle_started else self.thumbnail_start_ms
@@ -5433,9 +8418,15 @@ class MainWindow(QMainWindow):
                     paths.append(item.data(Qt.UserRole))
         else:
             rect = self.list.viewport().rect()
-            for row in range(self.list.count()):
+            top_index = self.list.indexAt(rect.topLeft())
+            bottom_index = self.list.indexAt(rect.bottomRight())
+            top = top_index.row() if top_index.isValid() else 0
+            bottom = bottom_index.row() if bottom_index.isValid() else min(self.list.count() - 1, top + 40)
+            if bottom < top:
+                bottom = min(self.list.count() - 1, top + 40)
+            for row in range(max(0, top), min(self.list.count(), bottom + 1)):
                 item = self.list.item(row)
-                if self.list.visualItemRect(item).intersects(rect):
+                if item:
                     paths.append(item.data(Qt.UserRole))
         return paths
 
@@ -5449,7 +8440,10 @@ class MainWindow(QMainWindow):
             self.thumbnail_timer.start(self.thumbnail_gap_ms)
             return
         while self.thumbnail_queue:
-            path = self.thumbnail_queue.pop(0)
+            if hasattr(self.thumbnail_queue, "popleft"):
+                path = self.thumbnail_queue.popleft()
+            else:
+                path = self.thumbnail_queue.pop(0)
             self.thumbnail_queue_set.discard(path)
             if self.queue_thumbnail(path, priority=0):
                 self.thumbnail_cycle_started = True
@@ -5490,7 +8484,7 @@ class MainWindow(QMainWindow):
         self.thumbnail_cache_order.append(path)
         while self.thumbnail_cache_order and (
             len(self.thumbnail_cache_order) > 1024
-            or self.thumbnail_cache_bytes > THUMBNAIL_CACHE_LIMIT_BYTES
+            or self.thumbnail_cache_bytes > self.performance_policy.thumbnail_cache_limit_bytes
         ):
             old = self.thumbnail_cache_order.pop(0)
             self.thumbnail_cache.pop(old, None)
@@ -5547,7 +8541,7 @@ class MainWindow(QMainWindow):
 
     def sorted_entries(self, entries, sort_mode, ascending):
         def key_name(item):
-            return item.display_name.lower()
+            return natural_sort_key(item.display_name)
 
         if sort_mode.endswith("_desc"):
             ascending = False
@@ -5560,7 +8554,11 @@ class MainWindow(QMainWindow):
             "size": lambda x: 0 if x.is_dir else x.size,
             "size_asc": lambda x: 0 if x.is_dir else x.size,
             "size_desc": lambda x: 0 if x.is_dir else x.size,
-            "type": lambda x: (x.kind, x.path.suffix.lower(), x.path.name.lower()),
+            "type": lambda x: (
+                x.kind,
+                x.path.suffix.lower(),
+                natural_sort_key(x.display_name),
+            ),
             "modified": lambda x: x.mtime,
             "date_desc": lambda x: x.mtime,
             "date_asc": lambda x: x.mtime,
@@ -5681,7 +8679,13 @@ class MainWindow(QMainWindow):
     def watch_current_folder(self):
         try:
             folder_text = str(self.current_folder)
-            watchable = not self.virtual_unc_server and not folder_text.startswith("\\\\") and self.safe_is_dir(self.current_folder)
+            archive_virtual = self.normalized_location_path(self.current_folder) in self.archive_sources_by_root
+            watchable = (
+                not self.virtual_unc_server
+                and not archive_virtual
+                and not folder_text.startswith("\\\\")
+                and self.safe_is_dir(self.current_folder)
+            )
             target = folder_text if watchable else ""
             if target == self.watched_folder_path:
                 return
@@ -5710,30 +8714,56 @@ class MainWindow(QMainWindow):
         if text:
             self.open_location(text)
 
-    def open_location(self, text, add_history=True):
+    def open_location(self, text, add_history=True, navigation=None):
         text = str(text).strip().strip('"')
         if not text:
             return False
         server = unc_server_name(text)
         if server:
-            return self.load_unc_server(server, add_history=add_history)
+            return self.load_unc_server(server, add_history=add_history, navigation=navigation)
         if "::" in str(text):
-            archive = str(text).split("::", 1)[0]
-            return self.open_archive(archive, add_history=add_history)
+            archive_text, inner_text = str(text).split("::", 1)
+            archive = Path(archive_text)
+            inner_parts = [part for part in inner_text.replace("\\", "/").split("/") if part and part != "."]
+            if inner_parts:
+                for root_key, root_archive in list(self.archive_sources_by_root.items()):
+                    if os.path.normcase(os.path.abspath(str(root_archive))) != os.path.normcase(os.path.abspath(str(archive))):
+                        continue
+                    root = Path(root_key)
+                    candidate = root.joinpath(*inner_parts)
+                    candidate_key = self.normalized_location_path(candidate)
+                    if candidate_key in self.archive_sources_by_root:
+                        relative_text = "/".join(inner_parts)
+                        display = f"{archive}::{relative_text}"
+                        return self.load_folder(
+                            candidate,
+                            add_history=add_history,
+                            display_path=display,
+                            force=False,
+                            sync_tree=False,
+                            navigation=navigation,
+                        )
+            return self.open_archive(archive, add_history=add_history, navigation=navigation)
         path = Path(text)
         if path.is_file() and is_archive(path):
-            return self.open_archive(path, add_history=add_history)
-        return self.load_folder(path, add_history=add_history)
+            return self.open_archive(path, add_history=add_history, navigation=navigation)
+        return self.load_folder(path, add_history=add_history, navigation=navigation)
 
-    def load_unc_server(self, server, add_history=True):
+    def load_unc_server(self, server, add_history=True, navigation=None):
         display = f"\\\\{server}"
-        shares = unc_share_paths(server)
-        if not shares:
-            QMessageBox.warning(self, "Invalid path", f"Cannot open SMB path or no shared folders were found:\n{display}")
-            return False
+        self.archive_navigation_generation += 1
+        self.unc_generation += 1
+        generation = self.unc_generation
+        for previous_task in list(self.unc_share_task_refs):
+            previous_task.cancel()
+        for previous_task in list(self.folder_scan_task_refs):
+            previous_task.cancel()
+        self.folder_scan_pool.clear()
         self.virtual_unc_server = server
-        self.virtual_entries = shares
+        self.virtual_entries = []
+        self.current_folder = Path(display)
         self.display_path = display
+        self.prepare_navigation_position(navigation)
         self.path_edit.setText(display)
         if add_history:
             self.history = self.history[: self.history_index + 1]
@@ -5741,12 +8771,51 @@ class MainWindow(QMainWindow):
             self.history_index = len(self.history) - 1
         self.populate_list()
         self.update_current_tab()
+        task = UncShareTask(generation, server)
+        self.unc_share_task_refs.add(task)
+        task.signals.finished.connect(self.unc_share_ready, Qt.QueuedConnection)
+        self.folder_scan_pool.start(task, 10)
         return True
+
+    def unc_share_ready(self, generation, server, shares, result):
+        # Ignore a slow NetShareEnum reply after the user has navigated away
+        # or requested another server.
+        for task in list(self.unc_share_task_refs):
+            if getattr(task, "generation", None) == int(generation) and getattr(task, "server", None) == str(server):
+                self.unc_share_task_refs.discard(task)
+        if (
+            self.closing
+            or int(generation) != int(self.unc_generation)
+            or str(server) != str(self.virtual_unc_server)
+        ):
+            return
+        if result.get("cancelled"):
+            return
+        display = f"\\\\{server}"
+        if result.get("error") or not shares:
+            QMessageBox.warning(
+                self,
+                "Invalid path",
+                f"Cannot open SMB path or no shared folders were found:\n{display}",
+            )
+            return
+        self.virtual_entries = list(shares)
+        self.populate_list()
+        self.update_current_tab()
 
     def open_path(self, path):
         p = Path(path)
         if p.is_dir():
-            self.load_folder(p)
+            key = self.normalized_location_path(p)
+            archive_path = self.archive_sources_by_root.get(key)
+            if archive_path is not None:
+                root_key = self.archive_root_by_path.get(key, key)
+                root = Path(root_key)
+                relative = p.relative_to(root).as_posix() if p != root else ""
+                display = f"{archive_path}::{relative}" if relative else f"{archive_path}::"
+                self.load_folder(p, display_path=display, sync_tree=False)
+            else:
+                self.load_folder(p)
         elif is_archive(p):
             self.open_archive(p)
         elif is_media(p):
@@ -5814,6 +8883,11 @@ class MainWindow(QMainWindow):
         path_text = str(path_text).strip().strip('"')
         if not path_text:
             return
+        if unc_server_name(path_text):
+            if self.viewer:
+                self.exit_viewer_mode(refresh=False)
+            self.open_location(path_text)
+            return
         path = Path(path_text)
         direct_media_open = path.is_file() and is_media(path)
         if self.viewer:
@@ -5827,20 +8901,43 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Invalid path", f"Cannot open this path:\n{path_text}")
 
-    def open_archive(self, archive_path, add_history=True):
+    def open_archive(self, archive_path, add_history=True, navigation=None):
         archive_path = Path(archive_path)
         if not archive_path.exists():
             QMessageBox.warning(self, "Archive not found", f"Cannot open:\n{archive_path}")
             return False
-        task = ArchiveExtractTask(archive_path, add_history=add_history)
+        self.archive_navigation_generation += 1
+        request_id = self.archive_navigation_generation
+        self.unc_generation += 1
+        for previous_task in list(self.unc_share_task_refs):
+            previous_task.cancel()
+        self.unc_share_task_refs.clear()
+        for previous_task in list(self.archive_task_refs):
+            previous_task.cancel()
+        self.archive_pool.clear()
+        task = ArchiveExtractTask(
+            archive_path,
+            add_history=add_history,
+            navigation=navigation,
+            request_id=request_id,
+        )
         self.archive_task_refs.add(task)
         task.signals.finished.connect(lambda result, ref=task: self.archive_ready(result, ref))
         self.archive_pool.start(task)
         return True
 
+    def archive_source_for_path(self, path):
+        return self.archive_member_sources.get(str(path))
+
     def archive_ready(self, result, task):
         self.archive_task_refs.discard(task)
-        if self.closing or result.get("cancelled"):
+        if self.closing or result.get("cancelled") or int(result.get("request_id", 0)) != int(self.archive_navigation_generation):
+            session = result.get("session")
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
             tempdir = result.get("tempdir")
             if tempdir is not None:
                 try:
@@ -5855,24 +8952,122 @@ class MainWindow(QMainWindow):
                 "Archive error",
                 f"Cannot read archive:\n{archive_path}\n\n{result['error']}",
             )
+            session = result.get("session")
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            tempdir = result.get("tempdir")
+            if tempdir is not None:
+                try:
+                    tempdir.cleanup()
+                except Exception:
+                    pass
             return
         if not result.get("count") or result.get("tempdir") is None:
+            session = result.get("session")
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            tempdir = result.get("tempdir")
+            if tempdir is not None:
+                try:
+                    tempdir.cleanup()
+                except Exception:
+                    pass
             QMessageBox.information(self, "Archive", "No image files found in this zip.")
             return
         self.archive_tempdirs.append(result["tempdir"])
+        session = result.get("session")
+        if session is not None:
+            self.archive_sessions.append(session)
+        sources = result.get("sources") or {}
+        self.archive_member_sources.update(sources)
         root = Path(result["root"])
         snapshot_key = os.path.normcase(os.path.abspath(str(root)))
-        self.folder_cache[snapshot_key] = FolderSnapshot(
-            root,
-            list(result.get("entries") or []),
-            self.folder_signature(root),
-        )
+        self.archive_sources_by_root[snapshot_key] = archive_path
+        self.archive_root_by_path[snapshot_key] = snapshot_key
+        self.archive_context_last_used[snapshot_key] = time.monotonic()
+        self.archive_contexts[snapshot_key] = {
+            "tempdir": result.get("tempdir"),
+            "session": session,
+            "source_paths": set(sources),
+        }
+        snapshots = result.get("snapshots") or {str(root): list(result.get("entries") or [])}
+        for folder_text, folder_entries in snapshots.items():
+            virtual_folder = Path(folder_text)
+            folder_key = self.normalized_location_path(virtual_folder)
+            self.archive_sources_by_root[folder_key] = archive_path
+            self.archive_root_by_path[folder_key] = snapshot_key
+            self.archive_context_last_used[folder_key] = time.monotonic()
+            self._store_folder_snapshot(
+                folder_key,
+                FolderSnapshot(
+                    virtual_folder,
+                    list(folder_entries),
+                    self.folder_signature(virtual_folder),
+                ),
+            )
+        self.prune_archive_contexts()
         self.load_folder(
             root,
             add_history=result.get("add_history", True),
             display_path=f"{archive_path}::",
             force=False,
+            sync_tree=False,
+            navigation=result.get("navigation"),
         )
+
+    def prune_archive_contexts(self, keep=3):
+        """Bound temporary ZIP sessions while retaining recent navigation."""
+        roots = {}
+        for key, root_key in self.archive_root_by_path.items():
+            roots.setdefault(root_key, []).append(key)
+        if len(roots) <= max(1, int(keep)):
+            return
+        ordered = sorted(
+            roots,
+            key=lambda root_key: self.archive_context_last_used.get(root_key, 0.0),
+        )
+        current_root = self.archive_root_by_path.get(
+            self.normalized_location_path(self.current_folder), ""
+        )
+        for root_key in ordered:
+            if len(roots) <= max(1, int(keep)):
+                break
+            if root_key == current_root:
+                continue
+            context = self.archive_contexts.pop(root_key, None) or {}
+            for key in roots.pop(root_key, []):
+                self.archive_sources_by_root.pop(key, None)
+                self.archive_root_by_path.pop(key, None)
+                self.archive_context_last_used.pop(key, None)
+                self.folder_cache.pop(key, None)
+            for path in context.get("source_paths", set()):
+                self.archive_member_sources.pop(path, None)
+            tempdir = context.get("tempdir")
+            if tempdir is not None:
+                try:
+                    tempdir.cleanup()
+                except Exception:
+                    pass
+            session = context.get("session")
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            if tempdir in self.archive_tempdirs:
+                self.archive_tempdirs.remove(tempdir)
+            if session in self.archive_sessions:
+                self.archive_sessions.remove(session)
+            # The lists are kept for compatibility with existing shutdown
+            # code; sessions are closed only when their whole context leaves.
+            if roots.get(root_key) is not None:
+                roots.pop(root_key, None)
 
     def selected_paths(self):
         if self.view_combo.currentText() == "details":
@@ -5907,6 +9102,47 @@ class MainWindow(QMainWindow):
         copy_files_to_clipboard(existing)
         self.cut_clipboard_paths = {str(path) for path in existing}
 
+    def _start_file_operation(self, operation, **kwargs):
+        if self.closing:
+            return None
+        task = FileOperationTask(operation, **kwargs)
+        self.file_op_task_refs.add(task)
+        task.signals.finished.connect(
+            lambda result, ref=task: self._file_operation_finished(result, ref),
+            Qt.QueuedConnection,
+        )
+        self.file_op_pool.start(task)
+        return task
+
+    def _file_operation_finished(self, result, task):
+        self.file_op_task_refs.discard(task)
+        if self.closing or result.get("cancelled"):
+            return
+        errors = list(result.get("errors") or [])
+        if errors:
+            title = "Paste failed" if result.get("operation") == "paste" else "Delete failed"
+            QMessageBox.warning(self, title, "Could not complete operation:\n\n" + "\n\n".join(errors[:3]))
+        if result.get("operation") == "paste" and self.cut_clipboard_paths:
+            self.cut_clipboard_paths = set()
+        target_folder = Path(result.get("target_folder") or self.current_folder)
+        self.invalidate_folder_cache(target_folder)
+        current_target = self.normalized_location_path(self.current_folder) == self.normalized_location_path(target_folder)
+        if current_target:
+            self.populate_list(force=True)
+        if current_target and self.viewer and self.main_stack.currentWidget() == self.viewer:
+            current = str(self.viewer.items[self.viewer.index]) if self.viewer.items else ""
+            self.viewer.items = [Path(p) for p in self.media_paths]
+            if self.viewer.items:
+                if current in self.media_paths:
+                    self.viewer.index = self.media_paths.index(current)
+                else:
+                    self.viewer.index = min(self.viewer.index, len(self.viewer.items) - 1)
+                self.viewer.show_current(reset=False)
+            self.viewer.setFocus()
+        copied = list(result.get("copied") or [])
+        if copied and current_target and self.main_stack.currentWidget() == self.explorer_root:
+            self.select_path(copied[0])
+
     def paste_from_clipboard(self, target_folder=None):
         active_viewer = bool(self.viewer and self.main_stack.currentWidget() == self.viewer)
         active_explorer = self.main_stack.currentWidget() == self.explorer_root
@@ -5923,41 +9159,12 @@ class MainWindow(QMainWindow):
         if not sources:
             return
         move_mode = bool(self.cut_clipboard_paths) and all(str(source) in self.cut_clipboard_paths for source in sources)
-        copied = []
-        for source in sources:
-            if not source.exists():
-                continue
-            try:
-                target = unique_copy_target(target_folder / source.name)
-                if source.is_dir() and path_contains(source, target):
-                    QMessageBox.warning(self, "Paste failed", f"Cannot paste a folder into itself:\n{source}")
-                    continue
-                if move_mode:
-                    shutil.move(str(source), str(target))
-                elif source.is_dir():
-                    shutil.copytree(source, target)
-                else:
-                    shutil.copy2(source, target)
-                copied.append(str(target))
-            except Exception as exc:
-                QMessageBox.warning(self, "Paste failed", f"Could not paste:\n{source}\n\n{exc}")
-                break
-        if move_mode:
-            self.cut_clipboard_paths = set()
-        self.invalidate_folder_cache(target_folder)
-        self.populate_list(force=True)
-        if active_viewer and self.viewer:
-            current = str(self.viewer.items[self.viewer.index]) if self.viewer.items else ""
-            self.viewer.items = [Path(p) for p in self.media_paths]
-            if self.viewer.items:
-                if current in self.media_paths:
-                    self.viewer.index = self.media_paths.index(current)
-                else:
-                    self.viewer.index = min(self.viewer.index, len(self.viewer.items) - 1)
-                self.viewer.show_current(reset=False)
-            self.viewer.setFocus()
-        elif copied:
-            self.select_path(copied[0])
+        self._start_file_operation(
+            "paste",
+            target_folder=target_folder,
+            sources=sources,
+            move_mode=move_mode,
+        )
 
     def open_selected_viewer(self):
         if QApplication.focusWidget() is self.path_edit:
@@ -5974,11 +9181,20 @@ class MainWindow(QMainWindow):
         path = Path(path)
         if not path.exists() or not path.is_file() or not is_media(path):
             return False
-        self.current_folder = path.parent
+        target_folder = path.parent
+        # A file-association request can arrive while another folder is open.
+        # The target folder may have a snapshot from an earlier visit, but it
+        # is not being watched while inactive.  Show the requested file first,
+        # then force one background scan instead of trusting that stale cache.
+        self.invalidate_folder_cache(target_folder)
+        self.current_folder = target_folder
         self.startup_media_path = path
         self.prepare_startup_media_folder()
         if self.open_viewer_for(path):
-            QTimer.singleShot(0, self.start_startup_media_scan)
+            # One cancellable scan supplies both explorer rows and the active
+            # viewer's complete sibling list.  preserve_existing keeps the
+            # requested image visible while the scan runs.
+            self.populate_list(lightweight=True, force=True, preserve_existing=True)
             return True
         return False
 
@@ -5989,8 +9205,21 @@ class MainWindow(QMainWindow):
         try:
             idx = self.media_paths.index(path)
         except ValueError:
-            idx = 0
+            # Explorer/file-association paths can differ only in case or
+            # separator normalization on Windows.  Falling back to index 0
+            # opens an apparently random image and makes subsequent order
+            # navigation look corrupted, especially in large mixed folders.
+            requested_key = self.normalized_location_path(path)
+            idx = next(
+                (
+                    index
+                    for index, candidate in enumerate(self.media_paths)
+                    if self.normalized_location_path(candidate) == requested_key
+                ),
+                0,
+            )
         self.pause_thumbnail_work(cancel_pending=True)
+        self.preview.suspend()
         if self.main_stack.currentWidget() is self.explorer_root:
             self.explorer_geometry_before_viewer = self.saveGeometry()
         if self.viewer is None:
@@ -6002,7 +9231,28 @@ class MainWindow(QMainWindow):
             self.viewer.pasteRequested.connect(self.paste_from_clipboard)
             self.viewer.propertiesRequested.connect(lambda path: self.show_properties(Path(path)))
             self.main_stack.addWidget(self.viewer)
+        if self.vlc_prewarm_instance is not None:
+            self.viewer.vlc_instance = self.vlc_prewarm_instance
+            self.viewer.vlc_init_inflight = False
+            self.viewer.vlc_init_error = ""
+            bundles = list(self.vlc_prewarm_bundles)
+            self.vlc_prewarm_instance = None
+            self.vlc_prewarm_bundles = []
+            for player_instance, player in bundles:
+                self.viewer.video_player_instances[id(player)] = player_instance
+                self.viewer._configure_media_player(player)
+                self.viewer.video_standby_players.append(player)
+        elif self.vlc_prewarm_inflight:
+            # The viewer will queue the current video; the prewarm callback
+            # dispatches it as soon as the cold plugin scan completes.
+            self.viewer.vlc_init_inflight = True
         self.viewer.item_signatures = {str(entry.path): (entry.size, entry.mtime) for entry in self.entries}
+        active_media_paths = set(self.media_paths)
+        self.viewer.archive_sources = {
+            path: source
+            for path, source in self.archive_member_sources.items()
+            if path in active_media_paths
+        }
         thumbnail_icon = self.thumbnail_cache.get(path)
         self.viewer.opening_placeholder = (
             thumbnail_icon.pixmap(QSize(512, 512)) if thumbnail_icon is not None else QPixmap()
@@ -6012,8 +9262,7 @@ class MainWindow(QMainWindow):
         self.main_stack.setCurrentWidget(self.viewer)
         if self.settings.get("viewer_start_mode", "fullscreen") == "window":
             self.showNormal()
-            reader = QImageReader(path)
-            source_size = reader.size()
+            source_size = QImageReader(path).size() if is_image(path) else QSize()
             screen = QApplication.primaryScreen().availableGeometry()
             width = source_size.width() if source_size.isValid() else 960
             height = source_size.height() if source_size.isValid() else 720
@@ -6150,27 +9399,35 @@ class MainWindow(QMainWindow):
             self.showNormal()
         if self.explorer_geometry_before_viewer is not None:
             self.restoreGeometry(self.explorer_geometry_before_viewer)
-        visible_count = self.details.rowCount() if self.view_combo.currentText() == "details" else self.list.count()
-        if not self.entries and visible_count == 0 and self.media_paths:
-            immediate_entries = []
-            for media_path in self.media_paths:
-                path = Path(media_path)
-                if path.parent != Path(self.current_folder) or not is_media(path):
-                    continue
-                try:
-                    stat = path.stat()
-                    immediate_entries.append(MediaItem(path, False, size=int(stat.st_size), mtime=float(stat.st_mtime)))
-                except OSError:
-                    immediate_entries.append(MediaItem(path, False))
-            if immediate_entries:
+        if not self.entries:
+            snapshot = self.folder_cache.get(self.current_snapshot_key)
+            if snapshot is not None:
                 self.entries = self.sorted_entries(
-                    immediate_entries,
+                    list(snapshot.entries),
                     self.settings.get("sort_mode", "name"),
                     self.settings.get("sort_ascending", True),
                 )
-                self.render_entries(self.entries, lightweight=True)
-                visible_count = self.details.rowCount() if self.view_combo.currentText() == "details" else self.list.count()
-                self.populate_list(lightweight=True, force=False, preserve_existing=True)
+                self.entry_by_path = {str(entry.path): entry for entry in self.entries}
+                self.media_paths = [
+                    str(entry.path)
+                    for entry in self.entries
+                    if not entry.is_dir and is_media(entry.path)
+                ]
+                self.explorer_render_pending = True
+            elif self.media_paths:
+                # Emergency restore uses the already-known sibling list only;
+                # it deliberately performs no per-file stat and no folder scan.
+                self.entries = self.sorted_entries(
+                    [MediaItem(Path(path), False) for path in self.media_paths],
+                    self.settings.get("sort_mode", "name"),
+                    self.settings.get("sort_ascending", True),
+                )
+                self.entry_by_path = {str(entry.path): entry for entry in self.entries}
+                self.explorer_render_pending = True
+        if self.explorer_render_pending:
+            self.render_entries(self.entries, lightweight=True)
+            self.explorer_render_pending = False
+        visible_count = self.details.rowCount() if self.view_combo.currentText() == "details" else self.list.count()
         if refresh or self.explorer_dirty:
             self.populate_list(lightweight=True, force=True, preserve_existing=True)
         elif self.entries:
@@ -6178,7 +9435,14 @@ class MainWindow(QMainWindow):
                 self.render_entries(self.entries, lightweight=True)
         if current:
             self.select_path(current, scroll=False)
+        if self.pending_tree_path:
+            self.tree_sync_timer.start(0)
+        self.preview.resume()
         self.thumbnail_paused = True
+        # The viewer object is intentionally retained for fast re-entry.  Once
+        # it is hidden, warm libVLC again from the cached folder snapshot so a
+        # later video open does not pay the cold plugin-scan cost a second time.
+        self.schedule_vlc_prewarm(self.entries)
         self.thumbnail_resume_timer.start()
 
     def resume_thumbnails_after_viewer(self):
@@ -6215,19 +9479,77 @@ class MainWindow(QMainWindow):
                     break
 
     def go_up(self):
-        parent = self.current_folder.parent
+        # ``\\server`` is already the highest navigable level exposed by the
+        # explorer.  ``current_folder`` intentionally keeps the last physical
+        # folder while that virtual share list is visible, so never derive an
+        # Up target from that stale physical path.
+        if self.virtual_unc_server:
+            return
+        current_key = os.path.normcase(os.path.abspath(str(self.current_folder)))
+        archive_path = self.archive_sources_by_root.get(current_key)
+        if archive_path is not None:
+            root_key = self.archive_root_by_path.get(current_key, current_key)
+            if current_key != root_key:
+                root = Path(root_key)
+                parent = Path(self.current_folder).parent
+                relative = parent.relative_to(root).as_posix() if parent != root else ""
+                display = f"{archive_path}::{relative}" if relative else f"{archive_path}::"
+                self.load_folder(parent, display_path=display, sync_tree=False, navigation={"mode": "top"})
+            else:
+                self.open_location(Path(archive_path).parent, navigation={"mode": "top"})
+            return
+        parent = self.navigation_parent_path(self.current_folder)
         if parent != self.current_folder:
-            self.load_folder(parent)
+            # Going up from ``\\server\share`` must use the virtual UNC share
+            # listing rather than scanning ``\\server`` as a normal folder.
+            self.open_location(parent, navigation={"mode": "top"})
+
+    @staticmethod
+    def normalized_location_path(path):
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    @staticmethod
+    def navigation_parent_path(path):
+        path = Path(path)
+        text = str(path).replace("/", "\\").rstrip("\\")
+        if text.startswith("\\\\"):
+            parts = [part for part in text[2:].split("\\") if part]
+            # pathlib treats ``\\server\share`` as an indivisible drive root.
+            # The explorer still exposes ``\\server`` above that share.
+            if len(parts) == 2:
+                return Path(f"\\\\{parts[0]}")
+        return path.parent
+
+    def current_navigation_source_path(self):
+        if self.virtual_unc_server:
+            return Path(f"\\\\{self.virtual_unc_server}")
+        current_key = self.normalized_location_path(self.current_folder)
+        archive_path = self.archive_sources_by_root.get(current_key)
+        return Path(archive_path) if archive_path is not None else Path(self.current_folder)
+
+    def back_navigation_request(self, target_text):
+        source = self.current_navigation_source_path()
+        target_text = str(target_text).split("::", 1)[0]
+        target = Path(target_text)
+        if self.normalized_location_path(self.navigation_parent_path(source)) == self.normalized_location_path(target):
+            return {"mode": "anchor", "anchor": str(source)}
+        return {"mode": "top"}
 
     def go_back(self):
         if self.history_index > 0:
+            target = self.history[self.history_index - 1]
+            navigation = self.back_navigation_request(target)
             self.history_index -= 1
-            self.open_location(self.history[self.history_index], add_history=False)
+            self.open_location(target, add_history=False, navigation=navigation)
 
     def go_forward(self):
         if self.history_index + 1 < len(self.history):
             self.history_index += 1
-            self.open_location(self.history[self.history_index], add_history=False)
+            self.open_location(
+                self.history[self.history_index],
+                add_history=False,
+                navigation={"mode": "top"},
+            )
 
     def mousePressEvent(self, event):
         if self.main_stack.currentWidget() == self.explorer_root:
@@ -6301,13 +9623,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(self, "Delete", f"Move {len(paths)} item(s) to recycle bin if possible?\n\n{names}{more}")
         if answer != QMessageBox.Yes:
             return
-        for path in paths:
-            try:
-                send_to_recycle_bin(path)
-            except Exception:
-                QMessageBox.warning(self, "Delete failed", f"Could not move to recycle bin:\n{path}")
-        self.invalidate_folder_cache(self.current_folder)
-        self.populate_list(force=True)
+        self._start_file_operation("delete", sources=paths, target_folder=self.current_folder)
 
     def show_properties(self, path):
         path = Path(path)
@@ -6438,6 +9754,11 @@ class MainWindow(QMainWindow):
             task.cancel()
         for task in list(getattr(self, "archive_task_refs", set())):
             task.cancel()
+        for task in list(getattr(self, "unc_share_task_refs", set())):
+            task.cancel()
+        self.unc_share_task_refs.clear()
+        for task in list(getattr(self, "file_op_task_refs", set())):
+            task.cancel()
         if hasattr(self, "settings_save_timer") and self.settings_save_timer.isActive():
             self.settings_save_timer.stop()
             save_settings(self.settings)
@@ -6449,16 +9770,35 @@ class MainWindow(QMainWindow):
             getattr(self, "folder_scan_pool", None),
             getattr(self, "thumbnail_pool", None),
             getattr(self, "archive_pool", None),
+            getattr(self, "file_op_pool", None),
         ):
             if pool is not None:
                 pool.clear()
+                pool.waitForDone(1500)
         if self.viewer:
-            self.viewer.deactivate()
-            self.viewer.decode_pool.clear()
-            self.viewer.preload_decode_pool.clear()
+            self.viewer.shutdown_for_close()
+        if self.vlc_prewarm_thread is not None and self.vlc_prewarm_thread.is_alive():
+            self.vlc_prewarm_thread.join(timeout=1.0)
+        for _player_instance, player in list(self.vlc_prewarm_bundles):
+            try:
+                player.release()
+            except Exception:
+                pass
+        self.vlc_prewarm_bundles = []
+        if self.vlc_prewarm_instance is not None:
+            try:
+                self.vlc_prewarm_instance.release()
+            except Exception:
+                pass
+            self.vlc_prewarm_instance = None
         for tempdir in getattr(self, "archive_tempdirs", []):
             try:
                 tempdir.cleanup()
+            except Exception:
+                pass
+        for session in getattr(self, "archive_sessions", []):
+            try:
+                session.close()
             except Exception:
                 pass
         super().closeEvent(event)
@@ -6473,18 +9813,41 @@ def send_to_recycle_bin(path):
 
 
 def copy_files_to_clipboard(paths):
-    existing = [Path(path) for path in paths if Path(path).exists()]
+    # QMimeData's ``text/uri-list`` is translated to CF_HDROP by Qt on
+    # Windows, which is the format Explorer consumes for Ctrl+V.  Keep the
+    # URLs for Qt/internal paste and also publish the Unicode Windows file
+    # name flavor explicitly.  The latter matters on some Windows/Qt plugin
+    # combinations where the delayed CF_HDROP conversion is not advertised
+    # until the clipboard is queried by another process.
+    existing = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        # Explorer requires absolute filesystem paths.  Avoid resolving
+        # symlinks (or touching network targets) while still normalizing any
+        # relative path supplied by a viewer/list item.
+        if not path.is_absolute():
+            path = Path(os.path.abspath(str(path)))
+        existing.append(path)
     if not existing:
         return
     mime = QMimeData()
     mime.setUrls([QUrl.fromLocalFile(str(path)) for path in existing])
     mime.setText("\n".join(str(path) for path in existing))
+    if sys.platform == "win32":
+        windows_paths = "\0".join(str(path) for path in existing) + "\0\0"
+        mime.setData(
+            'application/x-qt-windows-mime;value="FileNameW"',
+            windows_paths.encode("utf-16le"),
+        )
     QApplication.clipboard().setMimeData(mime)
 
 
 def windows_shell_thumbnail_image(path, size=512):
     if sys.platform != "win32":
         return None
+    com_initialized = False
     try:
         class GUID(ctypes.Structure):
             _fields_ = [
@@ -6550,10 +9913,13 @@ def windows_shell_thumbnail_image(path, size=512):
         gdi32 = ctypes.windll.gdi32
         user32 = ctypes.windll.user32
         ole32.CoInitialize(None)
+        com_initialized = True
         factory = ctypes.c_void_p()
         shell32.SHCreateItemFromParsingName.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
         shell32.SHCreateItemFromParsingName.restype = ctypes.HRESULT
         if shell32.SHCreateItemFromParsingName(str(path), None, ctypes.byref(iid), ctypes.byref(factory)) < 0 or not factory:
+            ole32.CoUninitialize()
+            com_initialized = False
             return None
         obj = ctypes.cast(factory, ctypes.POINTER(IShellItemImageFactory))
         hbitmap = wintypes.HBITMAP()
@@ -6561,6 +9927,8 @@ def windows_shell_thumbnail_image(path, size=512):
         hr = obj.contents.lpVtbl.contents.GetImage(factory, SIZE(int(size), int(size)), flags, ctypes.byref(hbitmap))
         obj.contents.lpVtbl.contents.Release(factory)
         if hr < 0 or not hbitmap:
+            ole32.CoUninitialize()
+            com_initialized = False
             return None
 
         bitmap = BITMAP()
@@ -6569,6 +9937,8 @@ def windows_shell_thumbnail_image(path, size=512):
         height = int(bitmap.bmHeight)
         if width <= 0 or height <= 0:
             gdi32.DeleteObject(hbitmap)
+            ole32.CoUninitialize()
+            com_initialized = False
             return None
         bmi = BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
@@ -6585,10 +9955,19 @@ def windows_shell_thumbnail_image(path, size=512):
             user32.ReleaseDC(None, hdc)
             gdi32.DeleteObject(hbitmap)
         if lines == 0:
+            ole32.CoUninitialize()
+            com_initialized = False
             return None
         image = QImage(bytes(buffer), width, height, QImage.Format_ARGB32).copy()
+        ole32.CoUninitialize()
+        com_initialized = False
         return image if not image.isNull() else None
     except Exception:
+        if com_initialized:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
         return None
 
 

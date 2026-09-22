@@ -12,9 +12,9 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QPointF, QTimer, Qt
-from PySide6.QtGui import QImage, QKeyEvent, QMouseEvent, QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, QTimer, Qt
+from PySide6.QtGui import QColor, QIcon, QImage, QKeyEvent, QMouseEvent, QPalette, QPixmap, QWheelEvent
+from PySide6.QtWidgets import QApplication, QListWidgetItem
 
 import main
 
@@ -36,6 +36,7 @@ class RebuildTests(unittest.TestCase):
         for widget in widgets:
             if isinstance(widget, main.ViewerWindow):
                 widget.deactivate()
+                widget.shutdown_video_cleanup()
                 widget.close()
         for widget in widgets:
             if isinstance(widget, main.MainWindow):
@@ -50,6 +51,13 @@ class RebuildTests(unittest.TestCase):
                     if pool is not None:
                         pool.clear()
                         pool.waitForDone(5000)
+                for thread_name in ("video_start_thread", "video_cleanup_thread"):
+                    thread = getattr(widget, thread_name, None)
+                    if thread is not None and thread.is_alive():
+                        thread.join(timeout=1)
+        for widget in widgets:
+            if isinstance(widget, (main.MainWindow, main.ViewerWindow)):
+                widget.deleteLater()
         for _ in range(5):
             self.app.processEvents()
         self.tempdir.cleanup()
@@ -87,8 +95,20 @@ class RebuildTests(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.002)
 
-    def fake_vlc(self, delay=0.2, stop_delay=0):
-        state = {"players": [], "plays": 0, "instances": 0}
+    def wait_for_video_start(self, viewer, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and (
+            viewer.video_start_inflight
+            or viewer.video_player_create_inflight
+            or viewer.pending_video_requests
+        ):
+            self.app.processEvents()
+            time.sleep(0.002)
+        self.assertEqual(viewer.video_start_inflight, 0)
+        self.assertFalse(viewer.pending_video_requests)
+
+    def fake_vlc(self, delay=0.2, stop_delay=0, play_delay=0):
+        state = {"players": [], "plays": 0, "instances": 0, "play_threads": []}
 
         class FakeEventManager:
             def __init__(self):
@@ -115,7 +135,17 @@ class RebuildTests(unittest.TestCase):
                 self.release_calls = 0
                 self.pause_calls = 0
                 self.volume_values = []
+                self.mute_values = []
                 self.set_times = []
+                self.rate_values = []
+                self.scale_values = []
+                self.aspect_values = []
+                self.crop_values = []
+                self.hwnd_values = []
+                self.operations = []
+                self.current_time = 0
+                self.vout_count = 1
+                self.play_state = "stopped"
                 self.manager = FakeEventManager()
                 state["players"].append(self)
 
@@ -125,39 +155,98 @@ class RebuildTests(unittest.TestCase):
             def video_set_key_input(self, _enabled):
                 return None
 
+            def video_get_size(self, _index=0):
+                return (480, 854)
+
+            def video_set_scale(self, value):
+                self.scale_values.append(float(value))
+                return None
+
+            def video_set_aspect_ratio(self, value):
+                self.aspect_values.append(value)
+                return None
+
+            def video_set_crop_geometry(self, value):
+                self.crop_values.append(value)
+                return None
+
             def event_manager(self):
                 return self.manager
 
             def set_media(self, media):
                 self.media = media
+                self.current_time = 0
+                self.operations.append(("media", media))
+
+            def get_media(self):
+                return self.media
 
             def set_hwnd(self, hwnd):
                 self.hwnd = hwnd
+                self.hwnd_values.append(hwnd)
+                self.operations.append(("hwnd", hwnd))
 
             def play(self):
+                state["play_threads"].append(threading.get_ident())
+                if play_delay:
+                    time.sleep(play_delay)
                 state["plays"] += 1
+                self.play_state = "playing"
                 return 0
 
             def audio_set_volume(self, value):
                 self.volume_values.append(value)
                 return None
 
-            def set_pause(self, _paused):
+            def audio_set_mute(self, muted):
+                self.mute_values.append(bool(muted))
+                return None
+
+            def set_pause(self, paused):
                 self.pause_calls += 1
+                self.play_state = "paused" if paused else "playing"
+                self.operations.append(("pause", int(bool(paused))))
+                return None
+
+            def pause(self):
+                self.pause_calls += 1
+                self.play_state = "paused"
                 return None
 
             def set_time(self, value):
                 self.set_times.append(value)
+                self.current_time = int(value)
                 return None
+
+            def set_position(self, _value):
+                self.play_state = "ended"
+                self.vout_count = 0
+                return None
+
+            def get_time(self):
+                return self.current_time
+
+            def has_vout(self):
+                return self.vout_count
+
+            def get_state(self):
+                return self.play_state
+
+            def set_rate(self, value):
+                self.rate_values.append(float(value))
+                return 0
 
             def stop(self):
                 if stop_delay:
                     time.sleep(stop_delay)
                 self.stop_calls += 1
+                self.play_state = "stopped"
+                self.operations.append(("stop", None))
                 return None
 
             def release(self):
                 self.release_calls += 1
+                self.operations.append(("release", None))
                 return None
 
         class FakeInstance:
@@ -173,6 +262,15 @@ class RebuildTests(unittest.TestCase):
         class FakeVlc:
             class EventType:
                 MediaPlayerEndReached = object()
+                MediaPlayerVout = object()
+                MediaPlayerTimeChanged = object()
+
+            class State:
+                Playing = "playing"
+                Paused = "paused"
+                Stopped = "stopped"
+                Ended = "ended"
+                Error = "error"
 
             @staticmethod
             def Instance(*_args):
@@ -210,7 +308,7 @@ class RebuildTests(unittest.TestCase):
         media_folder = self.make_media_folder()
         with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
             window = main.MainWindow(media_folder)
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 4
             while time.monotonic() < deadline and len(window.entries) < 25:
                 self.app.processEvents()
                 time.sleep(0.002)
@@ -232,6 +330,29 @@ class RebuildTests(unittest.TestCase):
             window.thumbnail_pool.clear()
             window.thumbnail_pool.waitForDone(5000)
             window.folder_scan_pool.waitForDone(5000)
+
+    def test_numeric_filenames_use_natural_order_in_folder_zip_and_viewer_lists(self):
+        names = ["1.jpg", "10.jpg", "11.jpg", "2.jpg", "20.jpg", "3.jpg"]
+        entries = [main.MediaItem(Path(name)) for name in names]
+
+        ordered = main.MainWindow.sorted_entries(None, entries, "name", True)
+
+        self.assertEqual(
+            [entry.display_name for entry in ordered],
+            ["1.jpg", "2.jpg", "3.jpg", "10.jpg", "11.jpg", "20.jpg"],
+        )
+        self.assertEqual(
+            [str(entry.path) for entry in ordered if main.is_media(entry.path)],
+            ["1.jpg", "2.jpg", "3.jpg", "10.jpg", "11.jpg", "20.jpg"],
+        )
+
+    def test_natural_order_handles_mixed_zero_padding_and_text(self):
+        names = ["page10.jpg", "page002.jpg", "page2.jpg", "page01.jpg", "page1.jpg"]
+
+        self.assertEqual(
+            sorted(names, key=main.natural_sort_key),
+            ["page1.jpg", "page01.jpg", "page2.jpg", "page002.jpg", "page10.jpg"],
+        )
 
     def test_preview_and_viewer_entry_do_not_decode_on_ui_thread(self):
         image_path = self.root / "large.jpg"
@@ -297,6 +418,45 @@ class RebuildTests(unittest.TestCase):
         viewer.decode_pool.waitForDone(5000)
         viewer.preload_decode_pool.waitForDone(5000)
 
+    def test_static_image_navigation_reuses_the_painted_label(self):
+        paths = []
+        for index, color in enumerate(((18, 36, 54), (72, 90, 108), (126, 144, 162))):
+            path = self.root / f"steady_{index}.jpg"
+            Image.new("RGB", (960, 540), color).save(path, quality=90)
+            paths.append(path)
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["performance_profile"] = "conservative"
+        viewer = main.ViewerWindow(settings)
+        viewer.resize(1000, 700)
+        viewer.show()
+        viewer.load(paths, 0)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            if viewer.labels and not viewer.labels[0][0]._viewer_pixmap.isNull():
+                break
+            time.sleep(0.002)
+        original_label = viewer.labels[0][0]
+        self.assertFalse(original_label._viewer_pixmap.isNull())
+
+        viewer.next_media()
+
+        self.assertIs(viewer.labels[0][0], original_label)
+        self.assertEqual(viewer.labels[0][1], paths[1])
+        self.assertFalse(original_label._viewer_pixmap.isNull())
+        self.assertTrue(viewer.central.updatesEnabled())
+        deadline = time.monotonic() + 2
+        target_key = viewer.viewer_pixmap_cache_key(paths[1])
+        while time.monotonic() < deadline and target_key not in viewer.viewer_pixmap_cache:
+            self.app.processEvents()
+            time.sleep(0.002)
+        self.assertIn(target_key, viewer.viewer_pixmap_cache)
+        self.assertIs(viewer.labels[0][0], original_label)
+        viewer.deactivate()
+        viewer.close()
+        viewer.decode_pool.waitForDone(5000)
+        viewer.preload_decode_pool.waitForDone(5000)
+
     def test_webtoon_labels_keep_each_images_full_aspect_ratio(self):
         paths = []
         for index, size in enumerate(((900, 1800), (1000, 1500), (800, 2000))):
@@ -310,7 +470,7 @@ class RebuildTests(unittest.TestCase):
         viewer.resize(1000, 720)
         viewer.show()
         viewer.load(paths, 0)
-        deadline = time.monotonic() + 4
+        deadline = time.monotonic() + 10
         while time.monotonic() < deadline and len(viewer.webtoon_loaded) < len(paths):
             self.app.processEvents()
             time.sleep(0.002)
@@ -373,6 +533,15 @@ class RebuildTests(unittest.TestCase):
             if len(ticks) > 1:
                 self.assertLess(max(b - a for a, b in zip(ticks, ticks[1:])), 0.12)
             self.assertFalse(viewer.labels[0][0]._viewer_pixmap.isNull())
+            self.assertTrue(viewer.current_has_animation)
+            self.assertFalse(viewer.animated_rate_btn.isHidden())
+            rotate_layout = viewer.rotation_overlay.layout()
+            self.assertLess(rotate_layout.indexOf(viewer.rotate_right_btn), rotate_layout.indexOf(viewer.animated_rate_btn))
+            self.assertTrue(viewer.set_playback_rate("0.5x"))
+            active_task = next(iter(viewer.animated_image_states.values())).get("task")
+            self.assertIsNotNone(active_task)
+            self.assertEqual(active_task.rate_snapshot()[1], 0.5)
+            self.assertEqual(viewer.animated_rate_btn.text(), "0.5x")
             viewer.deactivate()
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and viewer.animated_image_task_refs:
@@ -383,7 +552,7 @@ class RebuildTests(unittest.TestCase):
         viewer.close()
         viewer.animated_image_pool.waitForDone(5000)
 
-    def test_static_webp_uses_animation_worker_once_without_looping(self):
+    def test_static_webp_never_starts_the_animation_worker(self):
         webp = self.root / "static.webp"
         Image.new("RGB", (800, 1000), (30, 70, 120)).save(webp, format="WEBP", quality=85)
         viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
@@ -392,21 +561,62 @@ class RebuildTests(unittest.TestCase):
         viewer.items = [webp]
         viewer.show_current()
         deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and (
+            not viewer.labels or viewer.labels[0][0]._viewer_pixmap.isNull()
+        ):
             self.app.processEvents()
-            states = list(viewer.animated_image_states.values())
-            if states and states[0].get("has_frame") and states[0].get("task") is None:
-                break
             time.sleep(0.002)
-        states = list(viewer.animated_image_states.values())
-        self.assertTrue(states)
-        self.assertTrue(states[0].get("has_frame"))
-        self.assertEqual(states[0].get("frame_count"), 1)
-        self.assertIsNone(states[0].get("task"))
+        self.assertFalse(viewer.is_animated_image_path(webp))
+        self.assertFalse(viewer.animated_image_states)
+        self.assertFalse(viewer.animated_image_task_refs)
+        self.assertFalse(viewer.current_has_animation)
+        self.assertTrue(viewer.animated_rate_btn.isHidden())
         self.assertFalse(viewer.labels[0][0]._viewer_pixmap.isNull())
         viewer.deactivate()
         viewer.close()
         viewer.animated_image_pool.waitForDone(5000)
+
+    def test_animated_webp_still_uses_the_animation_worker(self):
+        webp = self.root / "animated.webp"
+        frames = [
+            Image.new("RGB", (320, 180), color)
+            for color in ((180, 20, 20), (20, 180, 20), (20, 20, 180))
+        ]
+        frames[0].save(
+            webp,
+            format="WEBP",
+            save_all=True,
+            append_images=frames[1:],
+            duration=60,
+            loop=0,
+        )
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(960, 640)
+        viewer.show()
+        viewer.items = [webp]
+        viewer.show_current()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not viewer.current_has_animation:
+            self.app.processEvents()
+            time.sleep(0.002)
+        self.assertTrue(viewer.is_animated_image_path(webp))
+        self.assertTrue(viewer.current_has_animation)
+        self.assertTrue(viewer.animated_image_states)
+        self.assertFalse(viewer.animated_rate_btn.isHidden())
+        viewer.deactivate()
+        viewer.close()
+        viewer.animated_image_pool.waitForDone(5000)
+
+    def test_animated_webp_duration_parser_reads_anmf_timestamps(self):
+        path = self.root / "timed.webp"
+        chunks = []
+        for duration in (30, 40, 50):
+            frame_header = b"\0" * 12 + int(duration).to_bytes(3, "little") + b"\0"
+            chunks.append(b"ANMF" + len(frame_header).to_bytes(4, "little") + frame_header)
+        body = b"WEBP" + b"".join(chunks)
+        path.write_bytes(b"RIFF" + len(body).to_bytes(4, "little") + body)
+        self.assertEqual(main.animated_webp_frame_durations(path), [30, 40, 50])
+        self.assertEqual(main.animated_webp_frame_durations(self.root / "not-webp.gif"), [])
 
     def test_triple_animated_images_use_distinct_bounded_workers(self):
         gifs = [self.make_animated_gif(self.root / f"triple_{index}.gif", frame_count=6, size=(180, 120)) for index in range(3)]
@@ -417,7 +627,7 @@ class RebuildTests(unittest.TestCase):
         viewer.show()
         viewer.items = gifs
         viewer.show_current()
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             self.app.processEvents()
             states = list(viewer.animated_image_states.values())
@@ -440,7 +650,7 @@ class RebuildTests(unittest.TestCase):
         with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
             window = main.MainWindow(media_folder)
             window.settings.update(settings)
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 5
             while time.monotonic() < deadline and len(window.entries) < 11:
                 self.app.processEvents()
                 time.sleep(0.002)
@@ -518,6 +728,250 @@ class RebuildTests(unittest.TestCase):
             window.thumbnail_pool.waitForDone(5000)
             window.viewer.decode_pool.waitForDone(5000)
             window.viewer.preload_decode_pool.waitForDone(5000)
+
+    def test_external_media_open_replaces_stale_explorer_folder_context(self):
+        first_folder = self.root / "aaaa"
+        second_folder = self.root / "Downloads"
+        first_folder.mkdir()
+        second_folder.mkdir()
+        for index in range(3):
+            Image.new("RGB", (320, 240), (30 + index, 70, 120)).save(
+                first_folder / f"first_{index}.jpg",
+                quality=80,
+            )
+            Image.new("RGB", (360, 260), (80, 40 + index, 140)).save(
+                second_folder / f"second_{index}.jpg",
+                quality=80,
+            )
+        first = first_folder / "first_0.jpg"
+        second = second_folder / "second_1.jpg"
+        settings_path = self.root / "settings.json"
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["viewer_start_mode"] = "window"
+        settings_path.write_text(main.json.dumps(settings), encoding="utf-8")
+
+        with mock.patch.object(main, "SETTINGS_PATH", settings_path):
+            window = main.MainWindow(first_folder)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and len(window.entries) < 3:
+                self.app.processEvents()
+                time.sleep(0.002)
+
+            self.assertTrue(window.open_viewer_for(first))
+            window.open_external_request(second)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and (
+                len(window.entries) < 3
+                or any(entry.path.parent != second_folder for entry in window.entries)
+            ):
+                self.app.processEvents()
+                time.sleep(0.002)
+
+            window.exit_viewer_mode()
+            self.assertEqual(window.current_folder, second_folder)
+            self.assertEqual(Path(window.display_path), second_folder)
+            self.assertEqual(Path(window.tabs[window.current_tab]["path"]), second_folder)
+            self.assertEqual(len(window.entries), 3)
+            self.assertTrue(all(entry.path.parent == second_folder for entry in window.entries))
+            self.assertIn(str(second), window.media_paths)
+            self.assertEqual(
+                window.details.rowCount() if window.view_combo.currentText() == "details" else window.list.count(),
+                3,
+            )
+
+            window.close()
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+            window.viewer.decode_pool.waitForDone(5000)
+            window.viewer.preload_decode_pool.waitForDone(5000)
+
+    def test_external_media_open_rescans_an_inactive_cached_folder(self):
+        first_folder = self.root / "A"
+        second_folder = self.root / "B"
+        first_folder.mkdir()
+        second_folder.mkdir()
+        for index in range(1, 3):
+            Image.new("RGB", (320, 240), (30 * index, 70, 120)).save(
+                first_folder / f"{index}.jpg",
+                quality=80,
+            )
+            Image.new("RGB", (360, 260), (80, 40 * index, 140)).save(
+                second_folder / f"{index}.jpg",
+                quality=80,
+            )
+        settings_path = self.root / "settings.json"
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["viewer_start_mode"] = "window"
+        settings_path.write_text(main.json.dumps(settings), encoding="utf-8")
+
+        with mock.patch.object(main, "SETTINGS_PATH", settings_path):
+            # Visit B once so it has a valid but soon-to-be-stale cache, then
+            # leave it inactive while its contents change.
+            window = main.MainWindow(second_folder)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and len(window.entries) < 2:
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.assertEqual(len(window.entries), 2)
+
+            window.load_folder(first_folder, add_history=False)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and (
+                len(window.entries) < 2
+                or any(entry.path.parent != first_folder for entry in window.entries)
+            ):
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.assertTrue(window.open_viewer_for(first_folder / "1.jpg"))
+
+            clicked = second_folder / "3.jpg"
+            sibling = second_folder / "4.jpg"
+            Image.new("RGB", (380, 280), (120, 90, 40)).save(clicked, quality=80)
+            Image.new("RGB", (400, 300), (140, 100, 50)).save(sibling, quality=80)
+
+            window.open_external_request(clicked)
+            self.assertIs(window.main_stack.currentWidget(), window.viewer)
+            self.assertEqual(window.viewer.items[window.viewer.index], clicked)
+
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline and len(window.viewer.items) < 4:
+                self.app.processEvents()
+                time.sleep(0.002)
+
+            self.assertEqual(
+                [path.name for path in window.viewer.items],
+                ["1.jpg", "2.jpg", "3.jpg", "4.jpg"],
+            )
+            self.assertIn(sibling, window.viewer.items)
+            self.assertEqual(window.viewer.items[window.viewer.index], clicked)
+
+            window.exit_viewer_mode()
+            window.close()
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+            window.viewer.decode_pool.waitForDone(5000)
+            window.viewer.preload_decode_pool.waitForDone(5000)
+
+    def test_late_old_folder_scan_cannot_overwrite_external_media_folder(self):
+        first_folder = self.root / "slow_old"
+        second_folder = self.root / "new_target"
+        first_folder.mkdir()
+        second_folder.mkdir()
+        for index in range(4):
+            Image.new("RGB", (300, 220), (20, 60 + index, 100)).save(first_folder / f"old_{index}.jpg")
+            Image.new("RGB", (340, 250), (90, 40, 130 + index)).save(second_folder / f"new_{index}.jpg")
+        target = second_folder / "new_2.jpg"
+        settings_path = self.root / "settings.json"
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["viewer_start_mode"] = "window"
+        settings_path.write_text(main.json.dumps(settings), encoding="utf-8")
+
+        with mock.patch.object(main, "SETTINGS_PATH", settings_path):
+            window = main.MainWindow(first_folder)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and len(window.entries) < 4:
+                self.app.processEvents()
+                time.sleep(0.002)
+
+            original_scan = window.scan_folder_entries
+            old_scan_started = threading.Event()
+            release_old_scan = threading.Event()
+
+            def delayed_scan(folder, cancel_check=None):
+                if Path(folder) == first_folder and not old_scan_started.is_set():
+                    old_scan_started.set()
+                    release_old_scan.wait(1)
+                return original_scan(folder, cancel_check=cancel_check)
+
+            window.scan_folder_entries = delayed_scan
+            window.load_folder(first_folder, add_history=False, force=True)
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and not old_scan_started.is_set():
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.assertTrue(old_scan_started.is_set())
+
+            window.open_external_request(target)
+            release_old_scan.set()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and (
+                len(window.entries) < 4
+                or any(entry.path.parent != second_folder for entry in window.entries)
+            ):
+                self.app.processEvents()
+                time.sleep(0.002)
+
+            self.assertEqual(window.current_folder, second_folder)
+            self.assertEqual(len(window.entries), 4)
+            self.assertTrue(all(entry.path.parent == second_folder for entry in window.entries))
+            self.assertTrue(all("old_" not in entry.path.name for entry in window.entries))
+
+            window.exit_viewer_mode()
+            window.close()
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+            window.viewer.decode_pool.waitForDone(5000)
+            window.viewer.preload_decode_pool.waitForDone(5000)
+
+    def test_windowed_viewer_has_no_persistent_top_left_filename_badge(self):
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(1200, 700)
+        viewer.show()
+        self.app.processEvents()
+
+        self.assertIsNone(viewer.findChild(main.QLabel, "cornerFilenameLabel"))
+        self.assertTrue(viewer.top_filename_label is not None)
+        self.assertFalse(viewer.viewer_overlay.isVisible())
+
+        viewer.close()
+        viewer.decode_pool.waitForDone(5000)
+        viewer.preload_decode_pool.waitForDone(5000)
+
+    def test_viewer_overlay_labels_remain_readable_on_dark_overlay(self):
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(1200, 700)
+        viewer.show()
+        viewer.viewer_overlay.show()
+        viewer.rotation_overlay.show()
+        viewer.video_overlay.show()
+        self.app.processEvents()
+
+        expected = QColor("#f5f1fc")
+        labels = [
+            viewer.top_filename_label,
+            viewer.rotation_filename_label,
+            viewer.video_filename_label,
+            viewer.time_label,
+        ]
+        labels.extend(viewer.viewer_overlay.findChildren(main.QLabel))
+        labels.extend(viewer.video_overlay.findChildren(main.QLabel))
+        self.assertTrue(labels)
+        for label in labels:
+            self.assertEqual(label.palette().color(QPalette.WindowText), expected)
+
+        viewer.close()
+
+    def test_plain_plus_and_minus_keys_switch_to_manual_and_zoom(self):
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(1200, 700)
+        viewer.show()
+        self.app.processEvents()
+        viewer.fit_mode = "fit_height"
+        viewer.zoom_factor = 1.0
+
+        plus = QKeyEvent(QEvent.KeyPress, Qt.Key_Plus, Qt.ShiftModifier, "+")
+        viewer.keyPressEvent(plus)
+        self.assertTrue(plus.isAccepted())
+        self.assertEqual(viewer.fit_mode, "manual")
+        self.assertAlmostEqual(viewer.zoom_factor, 1.15)
+
+        minus = QKeyEvent(QEvent.KeyPress, Qt.Key_Minus, Qt.KeypadModifier, "-")
+        self.assertTrue(viewer.eventFilter(viewer.central, minus))
+        self.assertTrue(minus.isAccepted())
+        self.assertEqual(viewer.fit_mode, "manual")
+        self.assertAlmostEqual(viewer.zoom_factor, 1.0)
+
+        viewer.close()
 
     def test_windows_foreground_activation_is_not_persistently_topmost(self):
         window = main.MainWindow(self.root)
@@ -655,7 +1109,105 @@ class RebuildTests(unittest.TestCase):
             window.viewer.decode_pool.waitForDone(5000)
             window.viewer.preload_decode_pool.waitForDone(5000)
 
-    def test_non_webtoon_viewer_never_queues_speculative_preloads(self):
+    def test_direct_startup_media_scans_once_in_background_and_defers_hidden_rows(self):
+        folder = self.root / "large_direct_open"
+        folder.mkdir()
+        for index in range(1200):
+            (folder / f"media_{index:05d}.jpg").write_bytes(b"not-decoded-during-hidden-scan")
+        first = folder / "media_00000.jpg"
+        settings_path = self.root / "settings.json"
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["viewer_start_mode"] = "window"
+        settings_path.write_text(main.json.dumps(settings), encoding="utf-8")
+
+        with mock.patch.object(main, "SETTINGS_PATH", settings_path):
+            window = main.MainWindow(first)
+            window.show()
+            heartbeat = []
+            timer = QTimer()
+            timer.setInterval(5)
+            timer.timeout.connect(lambda: heartbeat.append(time.perf_counter()))
+            timer.start()
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline and len(window.entries) < 1200:
+                self.app.processEvents()
+                time.sleep(0.001)
+            timer.stop()
+
+            self.assertEqual(len(window.entries), 1200)
+            self.assertIs(window.main_stack.currentWidget(), window.viewer)
+            self.assertIsNone(window.startup_media_scan_iter)
+            self.assertFalse(window.startup_media_scan_timer.isActive())
+            self.assertTrue(window.explorer_render_pending)
+            self.assertEqual(window.list.count(), 0)
+            self.assertEqual(window.details.rowCount(), 0)
+            self.assertFalse(window.tree_sync_timer.isActive())
+            gaps = [later - earlier for earlier, later in zip(heartbeat, heartbeat[1:])]
+            self.assertLess(max(gaps, default=0), 0.12)
+
+            window.exit_viewer_mode()
+            self.assertFalse(window.explorer_render_pending)
+            self.assertEqual(window.list.count(), 1200)
+            window.close()
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+
+    def test_direct_startup_scan_rebuilds_provisional_multi_page_group(self):
+        folder = self.root / "direct_multi_page"
+        folder.mkdir()
+        for index in range(6):
+            Image.new("RGB", (320, 240), (20 + index, 70, 120)).save(
+                folder / f"image_{index:03d}.jpg"
+            )
+        first = folder / "image_002.jpg"
+        settings_path = self.root / "settings.json"
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["viewer_start_mode"] = "window"
+        settings["default_viewer_mode"] = "double"
+        settings_path.write_text(main.json.dumps(settings), encoding="utf-8")
+
+        with mock.patch.object(main, "SETTINGS_PATH", settings_path):
+            window = main.MainWindow(first)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and len(window.media_paths) < 6:
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.assertEqual(len(window.viewer.items), 6)
+            self.assertEqual(window.viewer.index, 2)
+            self.assertEqual(window.viewer.grid.count(), 2)
+            self.assertEqual(
+                [path.name for _label, path in window.viewer.labels],
+                ["image_002.jpg", "image_003.jpg"],
+            )
+            window.close()
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+            window.viewer.decode_pool.waitForDone(5000)
+            window.viewer.preload_decode_pool.waitForDone(5000)
+
+    def test_folder_refresh_while_viewing_updates_cache_without_rendering_hidden_explorer(self):
+        folder = self.make_media_folder(12)
+        first = next(folder.glob("*.jpg"))
+        with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
+            window = main.MainWindow(folder)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and len(window.entries) < 12:
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.assertTrue(window.open_viewer_for(first))
+            entries = list(window.entries)
+            key = window.current_snapshot_key
+            with mock.patch.object(window, "render_entries", wraps=window.render_entries) as render:
+                window.apply_folder_entries(entries, key, lightweight=True)
+                render.assert_not_called()
+                self.assertTrue(window.explorer_render_pending)
+                window.exit_viewer_mode()
+                self.assertEqual(render.call_count, 1)
+            window.close()
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+
+    def test_low_spec_non_webtoon_viewer_never_queues_speculative_preloads(self):
         media_folder = self.make_media_folder(8)
         first = next(media_folder.glob("*.jpg"))
         with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
@@ -665,6 +1217,7 @@ class RebuildTests(unittest.TestCase):
                 self.app.processEvents()
                 time.sleep(0.002)
             self.assertTrue(window.media_paths)
+            window.settings["performance_profile"] = "conservative"
             window.settings["default_viewer_mode"] = "single"
             self.assertTrue(window.open_viewer_for(first))
             self.pump_events(140)
@@ -677,6 +1230,34 @@ class RebuildTests(unittest.TestCase):
             window.thumbnail_pool.waitForDone(5000)
             window.viewer.decode_pool.waitForDone(5000)
             window.viewer.preload_decode_pool.waitForDone(5000)
+
+    def test_balanced_viewer_preloads_only_the_next_screen(self):
+        paths = []
+        for index in range(8):
+            path = self.root / f"lookahead_{index}.jpg"
+            Image.new("RGB", (640, 360), (20 + index, 60, 100)).save(path, quality=85)
+            paths.append(path)
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["performance_profile"] = "balanced"
+        viewer = main.ViewerWindow(settings)
+        viewer.items = paths
+        viewer.index = 2
+        viewer.viewer_mode = "single"
+        viewer.step_mode = "slide"
+        viewer.render_generation = 1
+
+        viewer.queue_viewer_preloads()
+
+        self.assertEqual(viewer.viewer_preload_queue, [paths[3]])
+        self.assertEqual(viewer.viewer_preload_queued, {str(paths[3])})
+        target_key = viewer.viewer_pixmap_cache_key(paths[3])
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and target_key not in viewer.viewer_pixmap_cache:
+            self.app.processEvents()
+            time.sleep(0.002)
+        self.assertIn(target_key, viewer.viewer_pixmap_cache)
+        viewer.close()
+        viewer.preload_decode_pool.waitForDone(5000)
 
     def test_direct_image_exit_never_returns_to_an_empty_explorer(self):
         media_folder = self.make_media_folder(6)
@@ -723,6 +1304,120 @@ class RebuildTests(unittest.TestCase):
             window.folder_scan_pool.waitForDone(5000)
             window.thumbnail_pool.waitForDone(5000)
 
+    def test_up_resets_to_top_and_back_centers_entered_folder_in_every_view_mode(self):
+        parent = self.root / "navigation_parent"
+        parent.mkdir()
+        children = []
+        for index in range(60):
+            child = parent / f"folder_{index:03d}"
+            child.mkdir()
+            children.append(child)
+        target = children[42]
+        for index in range(55):
+            (target / f"nested_{index:03d}").mkdir()
+
+        def wait_for_folder(window, folder, expected_count):
+            expected_key = os.path.normcase(os.path.abspath(str(folder)))
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                current_key = os.path.normcase(os.path.abspath(str(window.current_folder)))
+                if current_key == expected_key and len(window.entries) == expected_count:
+                    self.pump_events(120)
+                    return
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.fail(f"folder did not finish loading: {folder}")
+
+        with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
+            for mode in ("details", "list", "small", "medium", "large"):
+                with self.subTest(mode=mode):
+                    window = main.MainWindow(parent)
+                    window.resize(900, 620)
+                    window.show()
+                    wait_for_folder(window, parent, 60)
+                    window.change_view_mode(mode)
+                    self.pump_events(180)
+
+                    # Prime the child snapshot, then deliberately leave its
+                    # active view at the bottom.  This reproduces the cached
+                    # folder case that previously leaked the raw scrollbar
+                    # value into the parent.
+                    window.load_folder(target)
+                    wait_for_folder(window, target, 55)
+                    active_view = window.details if mode == "details" else window.list
+                    active_view.verticalScrollBar().setValue(
+                        active_view.verticalScrollBar().maximum()
+                    )
+                    self.pump_events(80)
+
+                    window.go_up()
+                    wait_for_folder(window, parent, 60)
+                    self.pump_events(650)
+                    self.assertEqual(active_view.verticalScrollBar().value(), 0)
+                    self.assertEqual(window.selected_paths(), [])
+
+                    # Back from the child must restore semantic context: the
+                    # child row/icon is selected and placed at viewport center.
+                    window.load_folder(target)
+                    wait_for_folder(window, target, 55)
+                    active_view.verticalScrollBar().setValue(
+                        active_view.verticalScrollBar().maximum()
+                    )
+                    self.pump_events(80)
+                    window.go_back()
+                    wait_for_folder(window, parent, 60)
+                    self.pump_events(650)
+
+                    self.assertEqual(window.selected_paths(), [target])
+                    if mode == "details":
+                        item = window.detail_item_by_path[str(target)]
+                        item_rect = window.details.visualItemRect(item)
+                        viewport_rect = window.details.viewport().rect()
+                    else:
+                        item = window.list_item_by_path[str(target)]
+                        item_rect = window.list.visualItemRect(item)
+                        viewport_rect = window.list.viewport().rect()
+                    self.assertLessEqual(
+                        abs(item_rect.center().y() - viewport_rect.center().y()),
+                        max(60, item_rect.height()),
+                    )
+
+                    window.close()
+                    window.folder_scan_pool.waitForDone(5000)
+                    window.thumbnail_pool.waitForDone(5000)
+
+    def test_unc_share_up_uses_virtual_server_root_and_virtual_root_stays_put(self):
+        folder = self.root / "unc_navigation"
+        folder.mkdir()
+        with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
+            window = main.MainWindow(folder)
+            with mock.patch.object(window, "open_location", return_value=True) as open_location:
+                window.current_folder = Path(r"\\svr\share")
+                window.virtual_unc_server = ""
+                window.go_up()
+                open_location.assert_called_once()
+                target = open_location.call_args.args[0]
+                self.assertEqual(str(target).rstrip("\\"), r"\\svr")
+                self.assertEqual(
+                    open_location.call_args.kwargs["navigation"],
+                    {"mode": "top"},
+                )
+
+                open_location.reset_mock()
+                window.virtual_unc_server = "svr"
+                window.go_up()
+                open_location.assert_not_called()
+
+            window.virtual_unc_server = ""
+            window.current_folder = Path(r"\\svr\share")
+            self.assertEqual(
+                window.back_navigation_request(r"\\svr"),
+                {"mode": "anchor", "anchor": str(Path(r"\\svr\share"))},
+            )
+            window.close()
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+
     def test_home_end_move_to_first_and_last_items(self):
         listing = main.ThumbList()
         for index in range(8):
@@ -761,6 +1456,53 @@ class RebuildTests(unittest.TestCase):
         self.assertLessEqual(menu.sizeHint().width(), 300)
         self.assertLessEqual(menu.sizeHint().height(), 320)
         viewer.close()
+
+    def test_file_copy_exports_windows_explorer_clipboard_format(self):
+        target = self.root / "copy_target.jpg"
+        target.write_bytes(b"image")
+
+        class FakeClipboard:
+            def __init__(self):
+                self.mime = None
+
+            def setMimeData(self, mime):
+                self.mime = mime
+
+        clipboard = FakeClipboard()
+        with mock.patch.object(main.QApplication, "clipboard", return_value=clipboard):
+            main.copy_files_to_clipboard([target])
+
+        self.assertIsNotNone(clipboard.mime)
+        self.assertEqual(
+            [os.path.normcase(url.toLocalFile()) for url in clipboard.mime.urls()],
+            [os.path.normcase(str(target))],
+        )
+        self.assertIn(str(target), clipboard.mime.text())
+        if os.sys.platform == "win32":
+            windows_format = 'application/x-qt-windows-mime;value="FileNameW"'
+            self.assertIn(windows_format, clipboard.mime.formats())
+            payload = bytes(clipboard.mime.data(windows_format))
+            self.assertIn(str(target).encode("utf-16le"), payload)
+            self.assertTrue(payload.endswith(b"\x00\x00\x00\x00"))
+
+    def test_global_wheel_hook_requires_viewer_process_foreground(self):
+        hook = main.ViewerMouseWheelHook.__new__(main.ViewerMouseWheelHook)
+        hook.user32 = mock.Mock()
+        hook.user32.GetForegroundWindow.return_value = 101
+
+        def set_process_id(_hwnd, process_id):
+            process_id._obj.value = os.getpid() + 1
+            return 1
+
+        hook.user32.GetWindowThreadProcessId.side_effect = set_process_id
+        self.assertFalse(hook._viewer_process_is_foreground())
+
+        def set_own_process_id(_hwnd, process_id):
+            process_id._obj.value = os.getpid()
+            return 1
+
+        hook.user32.GetWindowThreadProcessId.side_effect = set_own_process_id
+        self.assertTrue(hook._viewer_process_is_foreground())
 
     def test_region_selection_emits_only_after_selection_click(self):
         label = main.PannableImageLabel()
@@ -835,6 +1577,66 @@ class RebuildTests(unittest.TestCase):
             window.folder_scan_pool.waitForDone(5000)
             window.thumbnail_pool.waitForDone(5000)
 
+    def test_viewer_popup_controls_keep_contrast_in_light_theme(self):
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["theme"] = "light"
+        viewer = main.ViewerWindow(settings)
+        popup = viewer.fit_combo.view()
+        self.assertEqual(popup.palette().color(QPalette.Base).name(), "#211e29")
+        self.assertEqual(popup.palette().color(QPalette.Text).name(), "#f5f1fc")
+        self.assertEqual(popup.palette().color(QPalette.Highlight).name(), "#7560b4")
+        self.assertIn("background-color: #211e29", popup.styleSheet())
+        self.assertIn("color: #f5f1fc", popup.styleSheet())
+        self.assertIn("background: #211e29", viewer.mode_btn.menu().styleSheet())
+        self.assertIn("color: #f5f1fc", viewer.mode_btn.menu().styleSheet())
+        self.assertIn("--quiet", main.VLC_INSTANCE_ARGS)
+        self.assertNotIn("--vout=direct3d11", main.VLC_INSTANCE_ARGS)
+        viewer.deactivate()
+        viewer.shutdown_video_cleanup()
+        viewer.close()
+        for thread in (viewer.video_start_thread, viewer.video_cleanup_thread):
+            thread.join(timeout=1)
+
+    def test_video_fit_modes_match_image_geometry_including_fit_height(self):
+        fake_vlc, state = self.fake_vlc(delay=0)
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(1000, 1500)
+        viewer.central.resize(1000, 1500)
+        frame = viewer.video_frame
+        frame.resize(1000, 1500)
+        viewer._native_video_frame_size = lambda _frame: QSize(1750, 2625)
+        player = fake_vlc.Instance().media_player_new()
+        slot = {
+            "generation": viewer.render_generation,
+            "player": player,
+            "frame": frame,
+        }
+
+        viewer.fit_mode = "fit_height"
+        viewer.zoom_factor = 1.0
+        self.assertTrue(viewer.apply_video_fit(slot))
+        self.assertEqual(player.scale_values[-1], 0.0)
+
+        expected = {
+            "fit_width": 0.0,
+            "fit_window": 0.0,
+            "actual": 1.0,
+        }
+        for mode, scale in expected.items():
+            slot["fit_scale"] = None
+            viewer.fit_mode = mode
+            self.assertTrue(viewer.apply_video_fit(slot))
+            self.assertAlmostEqual(player.scale_values[-1], scale, places=4)
+
+        slot["fit_scale"] = None
+        viewer.fit_mode = "manual"
+        viewer.zoom_factor = 1.25
+        self.assertTrue(viewer.apply_video_fit(slot))
+        self.assertAlmostEqual(player.scale_values[-1], 1.25, places=4)
+        viewer.deactivate()
+        viewer.shutdown_video_cleanup()
+        viewer.close()
+
     def test_feedback_details_columns_preview_quality_and_tree_font(self):
         self.assertEqual(
             main.DetailsTable.HEADERS,
@@ -858,6 +1660,143 @@ class RebuildTests(unittest.TestCase):
             window.close()
             window.folder_scan_pool.waitForDone(5000)
             window.thumbnail_pool.waitForDone(5000)
+
+    def test_extension_row_colors_and_thumbnail_badges(self):
+        expected_keys = {
+            "photo.jpg": "jpeg",
+            "photo.png": "png",
+            "photo.webp": "webp",
+            "photo.gif": "gif",
+            "clip.mp4": "video",
+            "photo.tiff": "raster",
+        }
+        for path, expected in expected_keys.items():
+            self.assertEqual(main.type_color_key(path), expected)
+            self.assertTrue(main.type_color(path).isValid())
+            self.assertTrue(main.type_color(path, dark_theme=True).isValid())
+            self.assertNotEqual(
+                main.type_color(path).name(),
+                main.type_color(path, dark_theme=True).name(),
+            )
+        self.assertIsNone(main.type_color("folder", is_dir_entry=True))
+        self.assertIsNone(main.type_color("archive.zip"))
+        self.assertEqual(main.extension_badge_text("photo.webp"), "WEBP")
+        self.assertEqual(main.extension_badge_text("clip.mp4"), "MP4")
+        self.assertEqual(main.extension_badge_text("archive.zip"), "")
+
+        self.assertEqual(main.normalize_playback_rate("1.25x"), 1.25)
+        self.assertEqual(main.normalize_playback_rate("0.5"), 0.5)
+        self.assertIsNone(main.normalize_playback_rate("0"))
+        self.assertIsNone(main.normalize_playback_rate("fast"))
+        self.assertEqual(main.format_playback_rate(1), "1.0x")
+        self.assertEqual(main.format_playback_rate(0.25), "0.25x")
+
+        thumbnail_list = main.ThumbList()
+        thumbnail_list.resize(260, 260)
+        white = QPixmap(192, 192)
+        white.fill(QColor("white"))
+        item = QListWidgetItem("photo.jpg")
+        item.setData(Qt.UserRole, "photo.jpg")
+        item.setIcon(QIcon(white))
+        thumbnail_list.addItem(item)
+        badge_rgb = main.type_badge_color("photo.jpg").rgb() & 0xFFFFFF
+        thumbnail_list.show()
+        for mode in ("small", "medium", "large"):
+            thumbnail_list.set_view_mode_name(mode)
+            self.pump_events(30)
+            icon_image = thumbnail_list.grab().toImage().convertToFormat(QImage.Format_RGB32)
+            icon_badge_pixels = sum(
+                1
+                for y in range(icon_image.height())
+                for x in range(icon_image.width())
+                if (icon_image.pixel(x, y) & 0xFFFFFF) == badge_rgb
+            )
+            self.assertGreater(icon_badge_pixels, 10, mode)
+
+        thumbnail_list.set_dark_theme(False)
+        thumbnail_list.set_view_mode_name("list")
+        self.pump_events(30)
+        list_image = thumbnail_list.grab().toImage().convertToFormat(QImage.Format_RGB32)
+        list_badge_pixels = sum(
+            1
+            for y in range(list_image.height())
+            for x in range(list_image.width())
+            if (list_image.pixel(x, y) & 0xFFFFFF) == badge_rgb
+        )
+        self.assertEqual(list_badge_pixels, 0)
+        self.assertEqual(item.background().color().name(), main.type_color("photo.jpg").name())
+
+        details = main.DetailsTable()
+        details._dark_theme = False
+        details.setStyleSheet(
+            "QTableWidget { background: #ffffff; } "
+            "QTableWidget::item { padding: 4px; } "
+            "QTableWidget::item:selected { background: #dcd4ff; color: #231c34; }"
+        )
+        details.resize(720, 140)
+        details.load_entries(
+            [main.MediaItem(Path("photo.jpg"), size=1024, mtime=1)],
+            None,
+            lambda _entry: QIcon(),
+            lightweight=True,
+        )
+        details.show()
+        self.pump_events(30)
+        details_item = details.item(0, 0)
+        details_rect = details.visualItemRect(details_item)
+        details_image = details.viewport().grab().toImage()
+        details_row_color = QColor(
+            details_image.pixel(details_rect.right() - 8, details_rect.center().y())
+        ).name()
+        self.assertEqual(details_row_color, main.type_color("photo.jpg").name())
+        details.selectRow(0)
+        self.pump_events(20)
+        selected_image = details.viewport().grab().toImage()
+        selected = QColor(
+            selected_image.pixel(details_rect.right() - 8, details_rect.center().y())
+        ).name()
+        self.assertEqual(selected, "#dcd4ff")
+        details.close()
+        thumbnail_list.close()
+        details.deleteLater()
+        thumbnail_list.deleteLater()
+        self.app.processEvents()
+
+    def test_thumbnail_wheel_scrolls_three_rows_per_notch(self):
+        thumbnail_list = main.ThumbList()
+        thumbnail_list.resize(500, 380)
+        thumbnail_list.set_view_mode_name("large")
+        for index in range(80):
+            item = QListWidgetItem(f"image_{index:03d}.jpg")
+            item.setData(Qt.UserRole, f"image_{index:03d}.jpg")
+            thumbnail_list.addItem(item)
+        thumbnail_list.show()
+        self.pump_events(60)
+        self.assertEqual(
+            thumbnail_list.verticalScrollMode(),
+            main.QAbstractItemView.ScrollPerPixel,
+        )
+        wheel = QWheelEvent(
+            QPointF(20, 20),
+            QPointF(20, 20),
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt.NoButton,
+            Qt.NoModifier,
+            Qt.ScrollUpdate,
+            False,
+        )
+        thumbnail_list.wheelEvent(wheel)
+        self.assertEqual(
+            thumbnail_list.verticalScrollBar().value(),
+            thumbnail_list.gridSize().height() * main.THUMBNAIL_WHEEL_ROWS,
+        )
+        thumbnail_list.set_view_mode_name("list")
+        self.assertEqual(
+            thumbnail_list.verticalScrollMode(),
+            main.QAbstractItemView.ScrollPerItem,
+        )
+        thumbnail_list.close()
 
     def test_historical_performance_profiles_and_single_dispatch(self):
         self.assertEqual(
@@ -1148,7 +2087,7 @@ class RebuildTests(unittest.TestCase):
             elapsed = time.perf_counter() - started
             self.assertLess(elapsed, 0.08)
             self.assertTrue(viewer.vlc_init_inflight)
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 4
             while time.monotonic() < deadline and viewer.vlc_instance is None:
                 self.app.processEvents()
                 time.sleep(0.002)
@@ -1158,6 +2097,33 @@ class RebuildTests(unittest.TestCase):
             self.assertEqual(state["instances"], 1)
             self.assertEqual(state["plays"], 1)
             self.assertEqual(viewer.video_path, video)
+        viewer.deactivate()
+        viewer.close()
+
+    def test_video_playback_start_runs_off_the_ui_thread(self):
+        video = self.root / "slow_play.mp4"
+        video.write_bytes(b"test")
+        fake_vlc, state = self.fake_vlc(delay=0.01, play_delay=0.2)
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(960, 640)
+        viewer.show()
+        viewer.items = [video]
+        ui_thread = threading.get_ident()
+        ticks = []
+        heartbeat = QTimer()
+        heartbeat.setInterval(10)
+        heartbeat.timeout.connect(lambda: ticks.append(time.perf_counter()))
+        with mock.patch.object(main, "vlc", fake_vlc):
+            heartbeat.start()
+            started = time.perf_counter()
+            viewer.show_current()
+            self.assertLess(time.perf_counter() - started, 0.08)
+            self.wait_for_video_start(viewer, timeout=4)
+            heartbeat.stop()
+            self.assertEqual(state["plays"], 1)
+            self.assertTrue(state["play_threads"])
+            self.assertTrue(all(thread_id != ui_thread for thread_id in state["play_threads"]))
+            self.assertGreaterEqual(len(ticks), 5)
         viewer.deactivate()
         viewer.close()
 
@@ -1174,21 +2140,24 @@ class RebuildTests(unittest.TestCase):
             started = time.perf_counter()
             viewer.load([image, video], 0)
             self.assertLess(time.perf_counter() - started, 0.08)
-            self.assertTrue(viewer.vlc_init_inflight)
+            self.assertFalse(viewer.vlc_init_inflight)
+            self.assertTrue(viewer.vlc_prewarm_timer.isActive())
+            self.pump_events(500)
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and viewer.vlc_init_inflight:
                 self.app.processEvents()
                 time.sleep(0.002)
             self.assertEqual(state["instances"], 1)
             self.assertEqual(state["plays"], 0)
-            self.assertEqual(len(viewer.video_standby_players), 1)
+            self.assertEqual(len(viewer.video_standby_players), main.VIDEO_INITIAL_PLAYER_TARGET)
             viewer.next_media()
+            self.wait_for_video_start(viewer)
             self.assertEqual(state["plays"], 1)
             self.assertEqual(viewer.video_path, video)
         viewer.deactivate()
         viewer.close()
 
-    def test_video_to_video_navigation_queues_slow_stop_off_ui_thread(self):
+    def test_video_to_video_navigation_uses_a_clean_player_and_surface(self):
         videos = []
         for index in range(2):
             video = self.root / f"nonblocking_stop_{index}.mp4"
@@ -1211,19 +2180,372 @@ class RebuildTests(unittest.TestCase):
             viewer.next_media()
             elapsed = time.perf_counter() - started
             self.assertLess(elapsed, 0.08)
+            self.wait_for_video_start(viewer)
             self.assertEqual(state["plays"], 2)
             self.assertIsNot(viewer.media_player, old_player)
             self.assertGreaterEqual(old_player.pause_calls, 1)
-            self.assertEqual(old_player.hwnd, 0)
-            self.assertEqual(old_player.volume_values[-1], 0)
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline and old_player.release_calls == 0:
-                self.app.processEvents()
-                time.sleep(0.002)
-            self.assertEqual(old_player.stop_calls, 1)
-            self.assertEqual(old_player.release_calls, 1)
+            self.assertEqual(viewer.media_player.media, str(videos[1]))
+            self.assertNotEqual(
+                int(viewer.media_player.hwnd or 0),
+                int(old_player.hwnd or 0),
+            )
+            self.assertNotIn(str(videos[1]), [value for op, value in old_player.operations if op == "media"])
+            self.assertTrue(old_player.hwnd_values and 0 not in old_player.hwnd_values)
         viewer.deactivate()
         viewer.close()
+
+    def test_video_to_image_transition_mutes_pauses_and_hides_before_cleanup(self):
+        video = self.root / "retire_audio.mp4"
+        video.write_bytes(b"test")
+        image = self.root / "after_video.jpg"
+        Image.new("RGB", (640, 480), (30, 60, 90)).save(image)
+        fake_vlc, state = self.fake_vlc(delay=0.01, stop_delay=0.15)
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(960, 640)
+        viewer.show()
+        viewer.items = [video, image]
+        with mock.patch.object(main, "vlc", fake_vlc):
+            viewer.show_current()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and viewer.vlc_init_inflight:
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.wait_for_video_start(viewer)
+            old_player = viewer.media_player
+            old_frame = next(iter(viewer.video_slot_states.values()))["frame"]
+            viewer.next_media()
+            self.assertEqual(viewer.index, 1)
+            self.assertTrue(old_frame.isHidden())
+            self.assertIn(True, old_player.mute_values)
+            self.assertIn(0, old_player.volume_values)
+            self.assertIn(("pause", 1), old_player.operations)
+            self.assertNotIn(("pause", 0), old_player.operations)
+            self.pump_events(main.VIDEO_CLEANUP_IDLE_MS + 30)
+            viewer.video_cleanup_queue.join()
+            self.assertGreaterEqual(old_player.stop_calls, 1)
+        viewer.deactivate()
+        viewer.close()
+
+    def test_video_frame_pool_is_bounded(self):
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        allocated = []
+        for _ in range(main.VIDEO_MAX_FRAMES_PER_SLOT):
+            frame = viewer.video_frame_for_index(0)
+            self.assertIsNotNone(frame)
+            allocated.append(frame)
+            viewer.video_frame_busy.add(id(frame))
+        self.assertIsNone(viewer.video_frame_for_index(0))
+        self.assertEqual(
+            len(viewer.video_frame_pools[0]),
+            main.VIDEO_MAX_FRAMES_PER_SLOT,
+        )
+        for frame in allocated:
+            viewer.video_frame_busy.discard(id(frame))
+        viewer.close()
+
+    def test_invalid_native_surface_never_starts_a_fallback_vlc_window(self):
+        video = self.root / "invalid_surface.mp4"
+        video.write_bytes(b"test")
+        fake_vlc, state = self.fake_vlc(delay=0)
+        instance = fake_vlc.Instance()
+        player = instance.media_player_new()
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.vlc_instance = instance
+        viewer.video_player_instances[id(player)] = instance
+        viewer.video_standby_players.append(player)
+        with mock.patch.object(viewer, "_native_video_handle", return_value=0), mock.patch.object(
+            viewer, "_ensure_video_standby_players"
+        ):
+            viewer._start_video_playback(video, viewer.video_frame, primary=True)
+        viewer.video_cleanup_queue.join()
+        self.pump_events(50)
+        self.assertEqual(state["plays"], 0)
+        self.assertEqual(player.hwnd_values, [])
+        self.assertEqual(player.release_calls, 1)
+        viewer.close()
+
+    def test_reused_video_surface_stays_covered_until_only_the_current_output_is_ready(self):
+        videos = []
+        for index in range(2):
+            video = self.root / f"covered_transition_{index}.mp4"
+            video.write_bytes(b"test")
+            videos.append(video)
+        fake_vlc, state = self.fake_vlc(delay=0.01)
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(960, 640)
+        viewer.show()
+        viewer.items = videos
+
+        with mock.patch.object(main, "vlc", fake_vlc):
+            viewer.show_current()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and viewer.vlc_init_inflight:
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.wait_for_video_start(viewer)
+
+            self.assertEqual(len(viewer.video_slot_states), 1)
+            old_token, old_state = next(iter(viewer.video_slot_states.items()))
+            player = old_state["player"]
+            label = old_state["frame"].findChild(main.QLabel, "videoStatusLabel")
+            self.assertIsNotNone(label)
+            self.assertFalse(label.isHidden())
+            old_serial = old_state["playback_serial"]
+
+            player.current_time = 0
+            viewer._mark_video_output_ready(old_token, old_serial)
+            self.pump_events(100)
+            self.assertFalse(label.isHidden())
+            self.assertFalse(old_state["revealed"])
+            player.current_time = 25
+            self.pump_events(180)
+            self.assertTrue(label.isHidden())
+            self.assertTrue(old_state["revealed"])
+
+            viewer.next_media()
+            self.wait_for_video_start(viewer)
+            self.assertIsNot(viewer.media_player, player)
+            self.assertEqual(len(viewer.video_slot_states), 1)
+            new_token, new_state = next(iter(viewer.video_slot_states.items()))
+            self.assertNotEqual(new_token, old_token)
+            new_label = new_state["frame"].findChild(main.QLabel, "videoStatusLabel")
+            self.assertIsNotNone(new_label)
+            self.assertFalse(new_label.isHidden())
+            self.assertFalse(new_state["revealed"])
+
+            new_player = new_state["player"]
+            new_player.current_time = 0
+            viewer._mark_video_output_ready(old_token, old_serial)
+            self.pump_events(100)
+            self.assertFalse(new_label.isHidden())
+            self.assertFalse(new_state["revealed"])
+
+            viewer._mark_video_output_ready(new_token, new_state["playback_serial"])
+            self.pump_events(100)
+            self.assertFalse(new_label.isHidden())
+            self.assertFalse(new_state["revealed"])
+            new_player.current_time = 25
+            self.pump_events(180)
+            self.assertTrue(new_label.isHidden())
+            self.assertTrue(new_state["revealed"])
+
+        viewer.deactivate()
+        viewer.close()
+
+    def test_navigation_does_not_wait_for_a_slow_video_start(self):
+        video = self.root / "slow_transition.mp4"
+        video.write_bytes(b"test")
+        image = self.root / "after_slow_transition.jpg"
+        Image.new("RGB", (640, 480), (45, 90, 125)).save(image)
+        fake_vlc, state = self.fake_vlc(delay=0.01, play_delay=0.6)
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(960, 640)
+        viewer.show()
+        viewer.items = [video, image]
+
+        with mock.patch.object(main, "vlc", fake_vlc):
+            viewer.show_current()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not viewer.video_start_inflight:
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.assertEqual(viewer.video_start_inflight, 1)
+
+            started = time.perf_counter()
+            viewer.next_media()
+            elapsed = time.perf_counter() - started
+            self.assertLess(elapsed, 0.15)
+            self.assertEqual(viewer.index, 1)
+            self.assertIsNone(viewer.pending_navigation_index)
+            self.assertFalse(viewer.current_is_video)
+
+            viewer.deactivate()
+            viewer.video_start_queue.join()
+            self.pump_events(100)
+        viewer.close()
+
+    def test_terminal_vlc_state_retires_black_slot_without_waiting_for_timeout(self):
+        video = self.root / "terminal_video.mp4"
+        video.write_bytes(b"test")
+        fake_vlc, state = self.fake_vlc(delay=0.01)
+        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        viewer.resize(960, 640)
+        viewer.show()
+        viewer.items = [video]
+
+        with mock.patch.object(main, "vlc", fake_vlc):
+            viewer.show_current()
+            self.wait_for_video_start(viewer)
+            player = viewer.media_player
+            self.assertIsNotNone(player)
+            player.play_state = "error"
+            self.pump_events(120)
+            self.assertEqual(viewer.video_slot_states, {})
+            self.assertIsNone(viewer.media_player)
+            self.assertEqual(viewer.video_path, None)
+
+        viewer.deactivate()
+        viewer.close()
+
+    def test_single_double_and_triple_video_navigation_rotate_clean_slot_players(self):
+        cases = (("single", 1, 8), ("double", 2, 8), ("triple", 3, 9))
+        for mode, slots, count in cases:
+            with self.subTest(mode=mode):
+                videos = []
+                for index in range(count):
+                    video = self.root / f"stable_{mode}_{index}.mp4"
+                    video.write_bytes(b"test")
+                    videos.append(video)
+                fake_vlc, state = self.fake_vlc(delay=0.01, stop_delay=0.2)
+                viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+                viewer.resize(1200, 700)
+                viewer.viewer_mode = mode
+                viewer.step_mode = "page"
+                viewer.show()
+                viewer.items = videos
+                video_start_geometries = []
+                original_start_video_playback = viewer._start_video_playback
+
+                def traced_start_video_playback(path, frame, primary=True):
+                    target = viewer.viewer_area()
+                    video_start_geometries.append(
+                        (frame.width(), frame.height(), target.width(), target.height())
+                    )
+                    return original_start_video_playback(path, frame, primary)
+
+                viewer._start_video_playback = traced_start_video_playback
+
+                with mock.patch.object(main, "vlc", fake_vlc):
+                    viewer.show_current()
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline and viewer.vlc_init_inflight:
+                        self.app.processEvents()
+                        time.sleep(0.002)
+                    self.wait_for_video_start(viewer)
+                    initial_players = [viewer.media_player, *viewer.extra_media_players]
+                    self.assertEqual(len(initial_players), slots)
+                    for player in initial_players:
+                        player.current_time = 25
+                    self.pump_events(180)
+
+                    while viewer.index + slots < len(videos):
+                        expected_index = min(len(videos) - 1, viewer.index + slots)
+                        started = time.perf_counter()
+                        viewer.next_media()
+                        self.assertLess(time.perf_counter() - started, 0.08)
+                        deadline = time.monotonic() + 3
+                        while time.monotonic() < deadline:
+                            for player in [viewer.media_player, *viewer.extra_media_players]:
+                                if player is not None:
+                                    player.current_time = 25
+                            self.app.processEvents()
+                            if (
+                                viewer.index == expected_index
+                                and viewer.pending_navigation_index is None
+                                and not viewer._video_lifecycle_busy()
+                                and len(
+                                    [
+                                        player
+                                        for player in [viewer.media_player, *viewer.extra_media_players]
+                                        if player is not None
+                                    ]
+                                ) == slots
+                            ):
+                                break
+                            time.sleep(0.002)
+                        self.assertEqual(viewer.index, expected_index)
+
+                    active = [
+                        player
+                        for player in [viewer.media_player, *viewer.extra_media_players]
+                        if player is not None
+                    ]
+                    self.assertEqual(len(active), slots)
+                    self.assertTrue(all(int(player.hwnd or 0) != 0 for player in active))
+                    self.assertTrue(all(int(player.hwnd or 0) != 0 for player in active))
+                    self.assertTrue(video_start_geometries)
+                    self.assertTrue(
+                        all(width == target_width and height == target_height for (
+                            width,
+                            height,
+                            target_width,
+                            target_height,
+                        ) in video_start_geometries),
+                        video_start_geometries,
+                    )
+
+                viewer.deactivate()
+                viewer.close()
+
+    def test_mixed_media_transitions_retire_old_vlc_players_on_hidden_surfaces(self):
+        cases = (("single", 1), ("double", 2), ("triple", 3))
+        for mode, slots in cases:
+            with self.subTest(mode=mode):
+                videos = []
+                for index in range(slots):
+                    video = self.root / f"mixed_{mode}_{index}.mp4"
+                    video.write_bytes(b"test")
+                    videos.append(video)
+                image = self.root / f"mixed_{mode}.jpg"
+                Image.new("RGB", (640, 480), (40, 70, 110)).save(image)
+
+                fake_vlc, state = self.fake_vlc(delay=0.01, stop_delay=0.05)
+                viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+                viewer.resize(1200, 700)
+                viewer.viewer_mode = mode
+                viewer.step_mode = "page"
+                viewer.show()
+                viewer.items = [*videos, image]
+
+                with mock.patch.object(main, "vlc", fake_vlc):
+                    viewer.show_current()
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline and viewer.vlc_init_inflight:
+                        self.app.processEvents()
+                        time.sleep(0.002)
+                    self.wait_for_video_start(viewer)
+                    for player in [viewer.media_player, *viewer.extra_media_players]:
+                        if player is not None:
+                            player.current_time = 25
+                    self.pump_events(120)
+
+                    players = [viewer.media_player, *viewer.extra_media_players]
+                    frames = [slot["frame"] for slot in viewer.video_slot_states.values()]
+                    frame_ids = [id(frame) for frame in frames]
+                    native_handles = [int(player.hwnd or 0) for player in players]
+                    self.assertEqual(len(players), slots)
+                    self.assertEqual(len(frames), slots)
+                    self.assertTrue(all(handle != 0 for handle in native_handles))
+
+                    viewer.next_media()
+                    self.assertEqual(viewer.index, slots)
+                    self.assertIsNone(viewer.media_player)
+                    self.assertEqual(len(viewer.extra_media_players), 0)
+                    self.assertGreaterEqual(len(viewer.video_standby_players), 0)
+                    self.assertTrue(all(frame.parent() is viewer.central for frame in frames))
+                    self.assertTrue(all(frame.isHidden() for frame in frames))
+
+                    viewer.previous_media()
+                    self.wait_for_video_start(viewer)
+                    active_players = [viewer.media_player, *viewer.extra_media_players]
+                    active_frames = [slot["frame"] for slot in viewer.video_slot_states.values()]
+                    self.assertTrue(all(player not in players for player in active_players))
+                    self.assertTrue(set(id(frame) for frame in active_frames).isdisjoint(frame_ids))
+                    self.assertTrue(all(0 not in player.hwnd_values for player in active_players))
+
+                    viewer.deactivate()
+                    self.pump_events(main.VIDEO_CLEANUP_IDLE_MS + 100)
+                    viewer.video_cleanup_queue.join()
+                    self.pump_events(50)
+                    for player in players:
+                        pause_index = player.operations.index(("pause", 1))
+                        stop_index = player.operations.index(("stop", None))
+                        release_index = player.operations.index(("release", None))
+                        self.assertLess(pause_index, stop_index)
+                        self.assertLess(stop_index, release_index)
+                        self.assertNotIn(("hwnd", 0), player.operations)
+
+                viewer.close()
 
     def test_stale_vlc_initialization_never_restarts_video_after_exit(self):
         video = self.root / "stale_init.mp4"
@@ -1271,6 +2593,7 @@ class RebuildTests(unittest.TestCase):
             while time.monotonic() < deadline and viewer.vlc_init_inflight:
                 self.app.processEvents()
                 time.sleep(0.002)
+            self.wait_for_video_start(viewer)
             self.assertEqual(state["plays"], 3)
             self.assertEqual(len(viewer.extra_media_players), 2)
             self.assertEqual(viewer.video_path, videos[0])
@@ -1300,24 +2623,76 @@ class RebuildTests(unittest.TestCase):
             while time.monotonic() < deadline and viewer.vlc_init_inflight:
                 self.app.processEvents()
                 time.sleep(0.002)
+            self.wait_for_video_start(viewer)
 
             self.assertEqual(state["plays"], 3)
+            initial_players = [viewer.media_player, *viewer.extra_media_players]
             self.assertEqual(len(viewer.video_slot_states), 3)
             self.assertTrue(viewer.video_loop_btn.isChecked())
             self.assertEqual(viewer.video_loop_btn.text(), "∞")
             self.assertEqual((viewer.video_loop_btn.width(), viewer.video_loop_btn.height()), (34, 28))
             layout = viewer.video_overlay.layout()
-            self.assertLess(layout.indexOf(viewer.stop_btn), layout.indexOf(viewer.video_loop_btn))
+            self.assertLess(layout.indexOf(viewer.stop_btn), layout.indexOf(viewer.video_rate_btn))
+            self.assertLess(layout.indexOf(viewer.video_rate_btn), layout.indexOf(viewer.video_loop_btn))
             self.assertLess(layout.indexOf(viewer.video_loop_btn), layout.indexOf(viewer.time_label))
+            self.assertEqual(viewer.video_rate_btn.text(), "1.0x")
+            self.assertEqual(
+                [action.text() for action in viewer.video_rate_btn.playback_rate_actions.values()],
+                ["0.25x", "0.5x", "0.75x", "1.0x", "2.0x"],
+            )
+
+            custom_edit = viewer.video_rate_btn.playback_rate_edit
+            custom_edit.setText("1.25x")
+            viewer.apply_custom_playback_rate(custom_edit, viewer.video_rate_btn.playback_rate_menu)
+            self.assertEqual(viewer.playback_rate, 1.25)
+            self.assertEqual(viewer.video_rate_btn.text(), "1.25x")
+
+            self.assertTrue(viewer.set_playback_rate("2x"))
+            self.assertEqual(viewer.video_rate_btn.text(), "2.0x")
+            self.assertEqual(viewer.animated_rate_btn.text(), "2.0x")
+            self.assertTrue(all(player.rate_values[-1:] == [2.0] for player in initial_players))
+            self.assertFalse(viewer.set_playback_rate("9x"))
+            self.assertEqual(viewer.playback_rate, 2.0)
 
             for player in list(state["players"]):
-                player.manager.trigger(fake_vlc.EventType.MediaPlayerEndReached)
-            deadline = time.monotonic() + 1
+                player.current_time = 25
+                player.manager.trigger(fake_vlc.EventType.MediaPlayerVout)
+            self.pump_events(100)
+            self.assertTrue(all(slot["revealed"] for slot in viewer.video_slot_states.values()))
+
+            for player in initial_players:
+                player.play_state = fake_vlc.State.Ended
+            viewer.update_video_controls()
+            deadline = time.monotonic() + 5
             while time.monotonic() < deadline and state["plays"] < 6:
                 self.app.processEvents()
                 time.sleep(0.002)
             self.assertEqual(state["plays"], 6)
-            self.assertTrue(all(player.set_times[-1:] == [0] for player in state["players"]))
+            restarted_players = [viewer.media_player, *viewer.extra_media_players]
+            self.assertEqual(len(restarted_players), 3)
+            self.assertTrue(all(player not in initial_players for player in restarted_players))
+            self.assertTrue(all(player.rate_values[-1:] == [2.0] for player in restarted_players))
+            self.assertTrue(all(not slot["revealed"] for slot in viewer.video_slot_states.values()))
+            self.assertTrue(
+                all(
+                    not slot["frame"].findChild(main.QLabel, "videoStatusLabel").isHidden()
+                    for slot in viewer.video_slot_states.values()
+                )
+            )
+
+            for player in list(state["players"]):
+                player.current_time = 25
+                player.manager.trigger(fake_vlc.EventType.MediaPlayerTimeChanged)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not all(
+                slot["revealed"] for slot in viewer.video_slot_states.values()
+            ):
+                for player in [viewer.media_player, *viewer.extra_media_players]:
+                    if player is not None:
+                        player.current_time = 25
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.assertTrue(all(slot["revealed"] for slot in viewer.video_slot_states.values()))
 
             viewer.video_loop_btn.click()
             self.assertFalse(viewer.video_loop_enabled)
@@ -1325,8 +2700,9 @@ class RebuildTests(unittest.TestCase):
             saved = main.json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertFalse(saved["video_loop_enabled"])
             plays_before = state["plays"]
-            for player in list(state["players"]):
-                player.manager.trigger(fake_vlc.EventType.MediaPlayerEndReached)
+            for player in restarted_players:
+                player.play_state = fake_vlc.State.Ended
+            viewer.update_video_controls()
             self.pump_events(120)
             self.assertEqual(state["plays"], plays_before)
 
@@ -1349,32 +2725,56 @@ class RebuildTests(unittest.TestCase):
         viewer.extra_media_players = [extra]
         viewer.video_path = self.root / "playing.mp4"
         viewer.stop_media()
+        viewer.video_cleanup_queue.join()
+        self.pump_events(50)
 
-        self.assertEqual(primary.stop_calls, 1)
-        self.assertEqual(primary.hwnd, 0)
-        self.assertIsNone(primary.media)
+        self.assertGreaterEqual(primary.stop_calls, 1)
+        self.assertGreaterEqual(primary.pause_calls, 1)
+        self.assertIn(True, primary.mute_values)
+        self.assertIn(0, primary.volume_values)
+        self.assertEqual(primary.hwnd, 101)
+        self.assertEqual(primary.media, "primary")
         self.assertEqual(primary.release_calls, 1)
-        self.assertEqual(extra.stop_calls, 1)
-        self.assertEqual(extra.hwnd, 0)
-        self.assertIsNone(extra.media)
+        self.assertGreaterEqual(extra.stop_calls, 1)
+        self.assertGreaterEqual(extra.pause_calls, 1)
+        self.assertIn(True, extra.mute_values)
+        self.assertIn(0, extra.volume_values)
+        self.assertEqual(extra.hwnd, 202)
+        self.assertEqual(extra.media, "extra")
         self.assertEqual(extra.release_calls, 1)
         self.assertEqual(viewer.extra_media_players, [])
         self.assertIsNone(viewer.media_player)
         self.assertIsNone(viewer.video_path)
 
         next_video = self.root / "next.mp4"
+        next_player = instance.media_player_new()
+        viewer.vlc_instance = instance
+        viewer.video_player_instances[id(next_player)] = instance
+        viewer.video_standby_players.append(next_player)
         viewer._start_video_playback(next_video, viewer.video_frame, primary=True)
+        self.wait_for_video_start(viewer)
         self.assertIsNotNone(viewer.media_player)
-        self.assertIs(viewer.media_player, state["players"][-1])
+        self.assertIs(viewer.media_player, next_player)
         self.assertEqual(viewer.video_path, next_video)
         self.assertEqual(state["plays"], 1)
         viewer.close()
 
     def test_folder_watcher_storm_is_debounced(self):
-        folder = self.make_media_folder(6)
-        with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
+        folder = self.root / "watched_media"
+        folder.mkdir()
+        for index in range(6):
+            Image.new("RGB", (320, 240), (index, 80, 140)).save(folder / f"image_{index:03d}.jpg")
+        (folder / "folder_a").mkdir()
+        settings_dir = self.root / "config"
+        settings_dir.mkdir()
+        with mock.patch.object(main, "SETTINGS_PATH", settings_dir / "settings.json"):
             window = main.MainWindow(folder)
-            self.pump_events(100)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and (
+                len(window.entries) < 7 or window.folder_scan_pool.activeThreadCount() > 0
+            ):
+                self.app.processEvents()
+                time.sleep(0.002)
             scans = 0
             original_scan = window.scan_folder_entries
 
@@ -1386,9 +2786,12 @@ class RebuildTests(unittest.TestCase):
             window.scan_folder_entries = counted_scan
             for _ in range(20):
                 window.on_watched_folder_changed(str(folder))
-            self.pump_events(450)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and scans < 1:
+                self.app.processEvents()
+                time.sleep(0.002)
             window.folder_scan_pool.waitForDone(5000)
-            self.pump_events(20)
+            self.pump_events(450)
             self.assertEqual(scans, 1)
             window.close()
             window.thumbnail_pool.waitForDone(5000)
@@ -1409,13 +2812,121 @@ class RebuildTests(unittest.TestCase):
             self.assertLess(time.perf_counter() - started, 0.05)
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline and (
-                not str(window.display_path).endswith("::") or len(window.entries) < 8
+                not str(window.display_path).endswith("::") or len(window.entries) < 1
+                or len(window.archive_member_sources) < 8
             ):
                 self.app.processEvents()
                 time.sleep(0.002)
             self.pump_events(100)
             self.assertTrue(str(window.display_path).endswith("::"))
+            self.assertEqual(len(window.entries), 1)
+            self.assertTrue(window.entries[0].is_dir)
+            self.assertEqual(len(window.archive_member_sources), 8)
+            nested = window.entries[0]
+            window.open_path(nested.path)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and len(window.entries) < 8:
+                self.app.processEvents()
+                time.sleep(0.002)
             self.assertEqual(len(window.entries), 8)
+            self.assertTrue(all(not Path(entry.path).exists() for entry in window.entries))
+            window.close()
+            window.archive_pool.waitForDone(5000)
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+
+    def test_zip_up_returns_to_original_archive_parent_without_exposing_temp(self):
+        source_folder = self.root / "server_share" / "images"
+        source_folder.mkdir(parents=True)
+        archive_path = source_folder / "album.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            data = BytesIO()
+            Image.new("RGB", (300, 200), (30, 60, 90)).save(data, format="JPEG")
+            archive.writestr("nested/image.jpg", data.getvalue())
+
+        with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
+            window = main.MainWindow(source_folder)
+            self.assertTrue(window.open_archive(archive_path))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not str(window.display_path).endswith("::"):
+                self.app.processEvents()
+                time.sleep(0.002)
+
+            extracted_root = Path(window.current_folder)
+            self.assertNotEqual(extracted_root, source_folder)
+            self.assertTrue(str(window.display_path).endswith("album.zip::"))
+            self.assertEqual(window.pending_tree_path, "")
+
+            window.go_up()
+            self.assertEqual(Path(window.current_folder), source_folder)
+            self.assertEqual(window.display_path, str(source_folder))
+            self.assertEqual(window.path_edit.text(), str(source_folder))
+            self.assertNotIn(str(extracted_root), window.path_edit.text())
+
+            window.close()
+            window.archive_pool.waitForDone(5000)
+            window.folder_scan_pool.waitForDone(5000)
+            window.thumbnail_pool.waitForDone(5000)
+
+    def test_archive_member_is_decoded_from_memory_without_materializing_a_file(self):
+        archive_path = self.root / "memory-only.zip"
+        data = BytesIO()
+        Image.new("RGB", (640, 480), (40, 80, 120)).save(data, format="JPEG")
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("nested/image.jpg", data.getvalue())
+
+        session = main.ArchiveSession(archive_path)
+        source = main.ArchiveMemberSource(session, "nested/image.jpg")
+        virtual_path = self.root / "never-created.jpg"
+        task = main.ImageDecodeTask(1, virtual_path, (160, 160), archive_source=source)
+        captured = []
+        task.signals.finished.connect(lambda *args: captured.append(args))
+        task.run()
+        self.pump_events(50)
+
+        self.assertFalse(virtual_path.exists())
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0][2])
+        self.assertEqual(captured[0][3]["image_size"], (640, 480))
+        session.close()
+
+    def test_archive_member_opens_in_viewer_without_extracted_file(self):
+        folder = self.root / "archive-viewer"
+        folder.mkdir()
+        archive_path = folder / "album.zip"
+        data = BytesIO()
+        Image.new("RGB", (500, 700), (90, 40, 130)).save(data, format="JPEG")
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("nested/image.jpg", data.getvalue())
+
+        with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
+            window = main.MainWindow(folder)
+            self.assertTrue(window.open_archive(archive_path))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and (
+                not str(window.display_path).endswith("::") or not window.entries
+            ):
+                self.app.processEvents()
+                time.sleep(0.002)
+
+            self.assertTrue(window.entries[0].is_dir)
+            window.open_path(window.entries[0].path)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not window.entries:
+                self.app.processEvents()
+                time.sleep(0.002)
+            self.assertTrue(window.entries)
+            virtual_path = str(window.entries[0].path)
+            self.assertFalse(Path(virtual_path).exists())
+            self.assertTrue(window.open_viewer_for(virtual_path))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not window.viewer.viewer_pixmap_cache:
+                self.app.processEvents()
+                time.sleep(0.002)
+
+            self.assertTrue(window.viewer.viewer_pixmap_cache)
+            self.assertEqual(window.viewer.archive_image_sizes[virtual_path], (500, 700))
+            self.assertFalse(Path(virtual_path).exists())
             window.close()
             window.archive_pool.waitForDone(5000)
             window.folder_scan_pool.waitForDone(5000)

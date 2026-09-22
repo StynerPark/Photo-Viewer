@@ -9,8 +9,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("Removes Photo Viewer and legacy Portable Photo Viewer file-association registration")]
 [assembly: AssemblyCompany("Photo Viewer")]
 [assembly: AssemblyProduct("Photo Viewer Default App Reset")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.11.0")]
+[assembly: AssemblyFileVersion("1.0.11.0")]
 
 internal static class PhotoViewerDefaultAppReset
 {

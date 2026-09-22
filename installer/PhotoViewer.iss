@@ -1,5 +1,5 @@
 #define AppName "Photo Viewer"
-#define AppVersion "1.0.1"
+#define AppVersion "2.0.0"
 #define AppExeName "PhotoViewer.exe"
 #define ProgId "PhotoViewer.Image"
 #define SourceDir "..\dist\PhotoViewer"
@@ -12,8 +12,8 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} v{#AppVersion}
 AppPublisher={#AppName}
-VersionInfoVersion=1.0.1.0
-VersionInfoProductVersion=1.0.1.0
+VersionInfoVersion=2.0.0.0
+VersionInfoProductVersion=2.0.0.0
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
@@ -21,9 +21,12 @@ DisableWelcomePage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog commandline
 UsePreviousPrivileges=no
+; Recalculate the scope-specific default directory on every run so users can
+; switch between per-user and all-users installs without reusing the previous
+; scope's path.
+UsePreviousAppDir=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-SetupArchitecture=x64
 WizardStyle=modern dynamic windows11 hidebevels
 WizardSizePercent=120,120
 WizardBackColor=#fdfcff
@@ -32,7 +35,7 @@ SetupIconFile={#SourceRoot}\app.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName} v{#AppVersion}
 OutputDir={#OutputDir}
-OutputBaseFilename=PhotoViewer_v1.0.1_Setup
+OutputBaseFilename=PhotoViewer_v2.0.0_Setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 CloseApplications=yes
@@ -50,7 +53,7 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "settings.json"; Flags: ig
 Source: "{#SourceRoot}\settings.example.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\INSTALLER_BUILD_v1.0.1.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\INSTALLER_BUILD_v2.0.0.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
@@ -66,6 +69,7 @@ const
   NoPreviousAssociation = '<none>';
   UninstallRegistryKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{26CDC75D-0D0D-401F-9F5C-5F65D5BDC143}_is1';
   LegacyUninstallRegistryKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{A83BE9D6-7C2C-4C70-9EEB-4EBEA01D2090}_is1';
+  UninstallRegistryBase = 'Software\Microsoft\Windows\CurrentVersion\Uninstall';
 
 var
   AssociationPage: TWizardPage;
@@ -214,36 +218,196 @@ begin
   UpdateSelectionCount;
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function ExtractUninstallExecutable(const CommandLine: String): String;
+var
+  S: String;
+  ClosingQuote, FirstSpace: Integer;
 begin
   Result := '';
-
-  if RegKeyExists(HKEY_CURRENT_USER, LegacyUninstallRegistryKey) or
-     RegKeyExists(HKEY_LOCAL_MACHINE, LegacyUninstallRegistryKey) then
-  begin
-    Result :=
-      '이전 Portable Photo Viewer 설치판이 남아 있습니다.' + #13#10 +
-      'Windows 앱 및 기능에서 이전 설치판을 제거한 뒤 Photo Viewer 설치를 다시 실행하세요.';
+  S := Trim(CommandLine);
+  if S = '' then
     exit;
-  end;
 
-  { Inno Setup permits a lowest-privilege installer to be installed once per
-    user and once per machine.  Keeping both copies makes Windows expose two
-    registrations for the same viewer, so explicitly prevent mixed scopes. }
-  if IsAdminInstallMode then
+  if S[1] = '"' then
   begin
-    if RegKeyExists(HKEY_CURRENT_USER, UninstallRegistryKey) then
-      Result :=
-        '현재 사용자용 Photo Viewer가 이미 설치되어 있습니다.' + #13#10 +
-        '중복 등록을 방지하려면 기존 사용자용 설치를 먼저 제거한 뒤 다시 실행하세요.';
+    Delete(S, 1, 1);
+    ClosingQuote := Pos('"', S);
+    if ClosingQuote > 0 then
+      Result := Copy(S, 1, ClosingQuote - 1);
   end
   else
   begin
-    if RegKeyExists(HKEY_LOCAL_MACHINE, UninstallRegistryKey) then
-      Result :=
-        '모든 사용자용 Photo Viewer가 이미 설치되어 있습니다.' + #13#10 +
-        '중복 등록을 방지하려면 기존 모든 사용자용 설치를 먼저 제거하거나 설치 범위를 모든 사용자로 선택하세요.';
+    FirstSpace := Pos(' ', S);
+    if FirstSpace > 0 then
+      Result := Copy(S, 1, FirstSpace - 1)
+    else
+      Result := S;
   end;
+end;
+
+function StartsWithVersionedName(const Name, Prefix: String): Boolean;
+var
+  VersionStart: Integer;
+begin
+  VersionStart := Length(Prefix) + 1;
+  Result :=
+    (Pos(Prefix, Name) = 1) and
+    (Length(Name) >= VersionStart) and
+    (Name[VersionStart] >= '0') and (Name[VersionStart] <= '9');
+end;
+
+function IsPhotoViewerDisplayName(const DisplayName: String): Boolean;
+var
+  Name: String;
+begin
+  Name := Lowercase(Trim(DisplayName));
+  Result :=
+    (Name = 'photo viewer') or
+    StartsWithVersionedName(Name, 'photo viewer v') or
+    (Name = 'portable photo viewer') or
+    StartsWithVersionedName(Name, 'portable photo viewer v');
+end;
+
+function RunRegisteredUninstaller(
+  Root: Integer; const RegistryKey: String; Elevate: Boolean;
+  var FailureMessage: String): Boolean;
+var
+  CommandLine, Uninstaller, Parameters: String;
+  ExitCode: Integer;
+  Started: Boolean;
+begin
+  Result := True;
+  if not RegKeyExists(Root, RegistryKey) then
+    exit;
+
+  if not RegQueryStringValue(Root, RegistryKey, 'QuietUninstallString', CommandLine) then
+    RegQueryStringValue(Root, RegistryKey, 'UninstallString', CommandLine);
+  Uninstaller := ExtractUninstallExecutable(CommandLine);
+  if (Uninstaller = '') or (not FileExists(Uninstaller)) then
+  begin
+    FailureMessage :=
+      '기존 Photo Viewer 제거 프로그램을 찾을 수 없습니다.' + #13#10 +
+      RegistryKey;
+    Result := False;
+    exit;
+  end;
+
+  Parameters := '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART';
+  if Elevate then
+    Started := ShellExec(
+      'runas', Uninstaller, Parameters, '', SW_HIDE,
+      ewWaitUntilTerminated, ExitCode)
+  else
+    Started := Exec(
+      Uninstaller, Parameters, '', SW_HIDE,
+      ewWaitUntilTerminated, ExitCode);
+
+  if not Started then
+  begin
+    FailureMessage :=
+      '기존 Photo Viewer 제거를 시작하지 못했습니다.' + #13#10 +
+      '전체 사용자 설치 제거 권한 요청을 취소했다면 다시 실행하여 허용해 주세요.';
+    Result := False;
+    exit;
+  end;
+
+  if ExitCode <> 0 then
+  begin
+    FailureMessage := Format(
+      '기존 Photo Viewer 제거가 실패했습니다. (종료 코드: %d)', [ExitCode]);
+    Result := False;
+    exit;
+  end;
+
+  if RegKeyExists(Root, RegistryKey) then
+  begin
+    FailureMessage :=
+      '기존 Photo Viewer 설치 정보가 제거 후에도 남아 있습니다.' + #13#10 +
+      'PC를 다시 시작한 뒤 설치 파일을 다시 실행해 주세요.';
+    Result := False;
+  end;
+end;
+
+function RemoveMatchingInstallations(
+  Root: Integer; Elevate: Boolean; var FailureMessage: String): Boolean;
+var
+  SubKeys: TArrayOfString;
+  RegistryKey, DisplayName: String;
+  I: Integer;
+begin
+  Result := True;
+  if not RegGetSubkeyNames(Root, UninstallRegistryBase, SubKeys) then
+    exit;
+
+  for I := 0 to GetArrayLength(SubKeys) - 1 do
+  begin
+    RegistryKey := UninstallRegistryBase + '\' + SubKeys[I];
+    DisplayName := '';
+    RegQueryStringValue(Root, RegistryKey, 'DisplayName', DisplayName);
+    if IsPhotoViewerDisplayName(DisplayName) then
+    begin
+      if not RunRegisteredUninstaller(
+        Root, RegistryKey, Elevate, FailureMessage) then
+      begin
+        Result := False;
+        exit;
+      end;
+    end;
+  end;
+end;
+
+function RemoveAllExistingInstallations(var FailureMessage: String): Boolean;
+var
+  IgnoreExitCode: Integer;
+begin
+  Result := False;
+
+  { Ensure an old viewer cannot keep its executable or VLC files locked. }
+  Exec(
+    ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM {#AppExeName}', '',
+    SW_HIDE, ewWaitUntilTerminated, IgnoreExitCode);
+
+  { Remove every registered per-user build, including legacy AppIds. }
+  if not RunRegisteredUninstaller(
+    HKEY_CURRENT_USER, UninstallRegistryKey, False, FailureMessage) then
+    exit;
+  if not RunRegisteredUninstaller(
+    HKEY_CURRENT_USER, LegacyUninstallRegistryKey, False, FailureMessage) then
+    exit;
+  if not RemoveMatchingInstallations(
+    HKEY_CURRENT_USER, False, FailureMessage) then
+    exit;
+
+  { Machine-wide uninstallers always run elevated. If Setup is already
+    elevated Windows reuses that token; otherwise this produces one UAC prompt. }
+  if not RunRegisteredUninstaller(
+    HKEY_LOCAL_MACHINE, UninstallRegistryKey, True, FailureMessage) then
+    exit;
+  if not RunRegisteredUninstaller(
+    HKEY_LOCAL_MACHINE, LegacyUninstallRegistryKey, True, FailureMessage) then
+    exit;
+  if not RemoveMatchingInstallations(
+    HKEY_LOCAL_MACHINE, True, FailureMessage) then
+    exit;
+
+  { Also cover installers built as 32-bit before the x64 packaging change. }
+  if not RunRegisteredUninstaller(
+    HKEY_LOCAL_MACHINE_32, UninstallRegistryKey, True, FailureMessage) then
+    exit;
+  if not RunRegisteredUninstaller(
+    HKEY_LOCAL_MACHINE_32, LegacyUninstallRegistryKey, True, FailureMessage) then
+    exit;
+  if not RemoveMatchingInstallations(
+    HKEY_LOCAL_MACHINE_32, True, FailureMessage) then
+    exit;
+
+  Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  RemoveAllExistingInstallations(Result);
 end;
 
 function AssociationRoot: Integer;
