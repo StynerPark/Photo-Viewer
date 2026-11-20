@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 LEGACY_APP_NAME = "Portable Photo Viewer"
 INSTANCE_SERVER_NAME = "StynerPark_PhotoViewer_Instance"
 DEFAULT_LAST_FOLDER_SETTING = r"%USERPROFILE%\Documents"
@@ -46,6 +46,7 @@ def migrate_legacy_settings(settings_path=None, local_appdata=None):
         local_appdata = os.environ.get("LOCALAPPDATA")
     settings_root = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
     legacy_candidates = (
+        settings_root / APP_NAME / "2.0.0" / "settings.json",
         settings_root / APP_NAME / "settings.json",
         settings_root / LEGACY_APP_NAME / "settings.json",
     )
@@ -64,23 +65,12 @@ if not VLC_DIR.exists():
     VLC_DIR = BASE_DIR / "vlc"
 
 VLC_DLL_DIRECTORY_HANDLE = None
-if VLC_DIR.exists():
-    os.environ["PATH"] = str(VLC_DIR) + os.pathsep + os.environ.get("PATH", "")
-    vlc_plugins = VLC_DIR / "plugins"
-    if vlc_plugins.exists():
-        os.environ["VLC_PLUGIN_PATH"] = str(vlc_plugins)
-    vlc_library = VLC_DIR / "libvlc.dll"
-    if vlc_library.exists():
-        os.environ["PYTHON_VLC_LIB_PATH"] = str(vlc_library)
-    if hasattr(os, "add_dll_directory"):
-        VLC_DLL_DIRECTORY_HANDLE = os.add_dll_directory(str(VLC_DIR))
 
 DEFAULT_START_FOLDER = Path.home() / "Documents"
 if not DEFAULT_START_FOLDER.exists():
     DEFAULT_START_FOLDER = Path.home()
 
-from PIL import Image
-from PIL.ImageQt import ImageQt
+from PIL import Image, ImageOps
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
     QBuffer,
@@ -112,6 +102,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFileIconProvider,
     QFileSystemModel,
     QFormLayout,
@@ -127,10 +118,12 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QStyle,
@@ -147,6 +140,21 @@ from PySide6.QtWidgets import (
     QWidget,
     QWidgetAction,
 )
+from PIL.ImageQt import ImageQt
+
+# Load Qt before adding the bundled VLC directory to the process DLL search
+# path. VLC ships DLL names that can overlap Qt's dependencies; prioritizing
+# VLC first makes a clean PyInstaller launch fail while importing QtCore.
+if VLC_DIR.exists():
+    os.environ["PATH"] = str(VLC_DIR) + os.pathsep + os.environ.get("PATH", "")
+    vlc_plugins = VLC_DIR / "plugins"
+    if vlc_plugins.exists():
+        os.environ["VLC_PLUGIN_PATH"] = str(vlc_plugins)
+    vlc_library = VLC_DIR / "libvlc.dll"
+    if vlc_library.exists():
+        os.environ["PYTHON_VLC_LIB_PATH"] = str(vlc_library)
+    if hasattr(os, "add_dll_directory"):
+        VLC_DLL_DIRECTORY_HANDLE = os.add_dll_directory(str(VLC_DIR))
 
 try:
     import vlc
@@ -425,6 +433,8 @@ DEFAULT_SETTINGS = {
         "forward": ["Alt+Right"],
         "rename": ["F2"],
         "delete": ["Delete"],
+        "convert_format": ["Ctrl+Shift+F"],
+        "rotate_image_permanent": ["Ctrl+Shift+R"],
     },
 }
 
@@ -1564,6 +1574,432 @@ class FileOperationTask(QRunnable):
                 self.signals.finished.emit(result)
             except RuntimeError:
                 pass
+
+
+CONVERT_FORMATS = {
+    "JPEG (.jpg)": ("JPEG", ".jpg"),
+    "PNG (.png)": ("PNG", ".png"),
+    "WebP (.webp)": ("WEBP", ".webp"),
+    "AVIF (.avif)": ("AVIF", ".avif"),
+    "Bitmap (.bmp)": ("BMP", ".bmp"),
+    "TIFF (.tiff)": ("TIFF", ".tiff"),
+}
+
+
+def eligible_transform_paths(paths):
+    result = []
+    seen = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        key = os.path.normcase(str(path))
+        if key in seen or path.suffix.lower() not in IMAGE_EXTS:
+            continue
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _prepare_image_for_save(source, target_format, quality=90, png_compress=6,
+                            preserve_metadata=True, background="white"):
+    image = Image.open(source)
+    image.load()
+    if int(getattr(image, "n_frames", 1) or 1) > 1:
+        image.close()
+        raise ValueError("Animated images are not supported by this operation.")
+
+    metadata = {}
+    if preserve_metadata:
+        for key in ("icc_profile", "dpi"):
+            value = image.info.get(key)
+            if value:
+                metadata[key] = value
+        try:
+            exif = image.getexif()
+            if exif:
+                exif[274] = 1
+                metadata["exif"] = exif.tobytes()
+        except Exception:
+            pass
+
+    prepared = ImageOps.exif_transpose(image)
+    if prepared is not image:
+        image.close()
+    if target_format in ("JPEG", "BMP"):
+        if prepared.mode in ("RGBA", "LA") or "transparency" in prepared.info:
+            rgba = prepared.convert("RGBA")
+            base = Image.new("RGB", rgba.size, background)
+            base.paste(rgba, mask=rgba.getchannel("A"))
+            if prepared is not rgba:
+                prepared.close()
+            prepared = base
+        elif prepared.mode != "RGB":
+            converted = prepared.convert("RGB")
+            prepared.close()
+            prepared = converted
+    elif target_format in ("PNG", "WEBP", "AVIF", "TIFF") and prepared.mode not in (
+        "1", "L", "LA", "RGB", "RGBA", "I", "F",
+    ):
+        converted = prepared.convert("RGBA" if "A" in prepared.getbands() else "RGB")
+        prepared.close()
+        prepared = converted
+
+    options = dict(metadata)
+    if target_format in ("JPEG", "WEBP", "AVIF"):
+        options["quality"] = max(1, min(100, int(quality)))
+    if target_format == "JPEG":
+        options.update(optimize=True, progressive=True)
+    elif target_format == "PNG":
+        options.update(compress_level=max(0, min(9, int(png_compress))), optimize=False)
+    elif target_format == "WEBP":
+        options["method"] = 4
+    return prepared, options
+
+
+def _save_with_metadata_fallback(image, target, target_format, options):
+    try:
+        image.save(target, format=target_format, **options)
+    except (TypeError, ValueError) as exc:
+        # Some Pillow encoders do not accept EXIF/ICC/DPI. Retry only after
+        # removing optional metadata, never after an I/O or codec failure.
+        reduced = {k: v for k, v in options.items() if k not in ("exif", "icc_profile", "dpi")}
+        if reduced == options:
+            raise exc
+        image.save(target, format=target_format, **reduced)
+
+
+def atomic_convert_image(source, destination, target_format, quality=90, png_compress=6,
+                         preserve_metadata=True, background="white"):
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image, options = _prepare_image_for_save(
+        source, target_format, quality, png_compress, preserve_metadata, background
+    )
+    temp_path = None
+    try:
+        handle = tempfile.NamedTemporaryFile(
+            prefix=f".{destination.stem}_", suffix=destination.suffix,
+            dir=destination.parent, delete=False,
+        )
+        temp_path = Path(handle.name)
+        handle.close()
+        _save_with_metadata_fallback(image, temp_path, target_format, options)
+        with temp_path.open("rb+") as saved:
+            os.fsync(saved.fileno())
+        os.replace(temp_path, destination)
+        temp_path = None
+    finally:
+        image.close()
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return destination
+
+
+def atomic_rotate_image(source, angle):
+    source = Path(source)
+    target_format = Image.registered_extensions().get(source.suffix.lower())
+    if not target_format or target_format not in Image.SAVE:
+        raise ValueError(f"This image format cannot be saved: {source.suffix}")
+    image = Image.open(source)
+    image.load()
+    if int(getattr(image, "n_frames", 1) or 1) > 1:
+        image.close()
+        raise ValueError("Animated images cannot be permanently rotated.")
+    info = dict(image.info)
+    source_exif = None
+    try:
+        source_exif = image.getexif()
+    except Exception:
+        pass
+    prepared = ImageOps.exif_transpose(image)
+    if prepared is not image:
+        image.close()
+    rotated = prepared.rotate(int(angle), expand=True)
+    prepared.close()
+    options = {}
+    for key in ("icc_profile", "dpi"):
+        if info.get(key):
+            options[key] = info[key]
+    try:
+        if source_exif:
+            source_exif[274] = 1
+            options["exif"] = source_exif.tobytes()
+    except Exception:
+        pass
+    if target_format == "JPEG":
+        if rotated.mode != "RGB":
+            converted = rotated.convert("RGB")
+            rotated.close()
+            rotated = converted
+        options.update(quality=95, subsampling=0, optimize=True)
+    elif target_format == "PNG":
+        options["compress_level"] = 6
+    elif target_format == "WEBP":
+        options.update(quality=95, method=4)
+    temp_path = None
+    try:
+        handle = tempfile.NamedTemporaryFile(
+            prefix=f".{source.stem}_rotate_", suffix=source.suffix,
+            dir=source.parent, delete=False,
+        )
+        temp_path = Path(handle.name)
+        handle.close()
+        _save_with_metadata_fallback(rotated, temp_path, target_format, options)
+        with temp_path.open("rb+") as saved:
+            os.fsync(saved.fileno())
+        os.replace(temp_path, source)
+        temp_path = None
+    finally:
+        rotated.close()
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return source
+
+
+class ImageTransformSignals(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+
+
+class ImageTransformTask(QRunnable):
+    def __init__(self, operation, sources, **options):
+        super().__init__()
+        self.operation = operation
+        self.sources = [Path(path) for path in sources]
+        self.options = options
+        self.cancelled = False
+        self.signals = ImageTransformSignals()
+
+    def cancel(self):
+        self.cancelled = True
+
+    def run(self):
+        result = {"operation": self.operation, "completed": [], "errors": [], "cancelled": False}
+        total = len(self.sources)
+        for index, source in enumerate(self.sources, 1):
+            if self.cancelled:
+                result["cancelled"] = True
+                break
+            try:
+                if self.operation == "convert":
+                    output_dir = Path(self.options.get("output_dir") or source.parent)
+                    suffix = str(self.options.get("suffix", "_converted"))
+                    extension = self.options["extension"]
+                    target = output_dir / f"{source.stem}{suffix}{extension}"
+                    same_as_source = os.path.normcase(str(target.resolve())) == os.path.normcase(str(source.resolve()))
+                    if same_as_source or not self.options.get("overwrite"):
+                        target = unique_copy_target(target)
+                    atomic_convert_image(
+                        source, target, self.options["format"],
+                        self.options.get("quality", 90), self.options.get("png_compress", 6),
+                        self.options.get("preserve_metadata", True), self.options.get("background", "white"),
+                    )
+                    result["completed"].append(str(target))
+                else:
+                    atomic_rotate_image(source, self.options["angle"])
+                    result["completed"].append(str(source))
+            except Exception as exc:
+                result["errors"].append(f"{source.name}: {exc}")
+            try:
+                self.signals.progress.emit(index, total, source.name)
+            except RuntimeError:
+                pass
+        try:
+            self.signals.finished.emit(result)
+        except RuntimeError:
+            pass
+
+
+class ImageEstimateSignals(QObject):
+    finished = Signal(int, str)
+
+
+class ImageEstimateTask(QRunnable):
+    def __init__(self, generation, sources, target_format, quality, png_compress, background):
+        super().__init__()
+        self.generation = generation
+        self.sources = [Path(path) for path in sources[:8]]
+        self.total_count = len(sources)
+        self.target_format = target_format
+        self.quality = quality
+        self.png_compress = png_compress
+        self.background = background
+        self.signals = ImageEstimateSignals()
+
+    def run(self):
+        encoded = 0
+        source_sample = 0
+        error = ""
+        try:
+            for source in self.sources:
+                source_sample += max(1, source.stat().st_size)
+                image, options = _prepare_image_for_save(
+                    source, self.target_format, self.quality, self.png_compress, False, self.background
+                )
+                try:
+                    buffer = BytesIO()
+                    _save_with_metadata_fallback(image, buffer, self.target_format, options)
+                    encoded += buffer.tell()
+                finally:
+                    image.close()
+            if self.sources and self.total_count > len(self.sources):
+                encoded = round(encoded * self.total_count / len(self.sources))
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self.signals.finished.emit(self.generation, f"{encoded}|{error}")
+        except RuntimeError:
+            pass
+
+
+def format_file_size(size):
+    size = int(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+class FormatConversionDialog(QDialog):
+    def __init__(self, sources, parent=None):
+        super().__init__(parent)
+        self.sources = list(sources)
+        self.estimate_generation = 0
+        self.estimate_refs = set()
+        self.estimate_pool = QThreadPool(self)
+        self.estimate_pool.setMaxThreadCount(1)
+        self.setWindowTitle("Convert Format")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"Selected images: {len(self.sources)}"))
+        form = QFormLayout()
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(CONVERT_FORMATS.keys())
+        self.quality_spin = QSpinBox()
+        self.quality_spin.setRange(1, 100)
+        self.quality_spin.setValue(90)
+        self.png_spin = QSpinBox()
+        self.png_spin.setRange(0, 9)
+        self.png_spin.setValue(6)
+        self.output_edit = QLineEdit()
+        self.output_edit.setPlaceholderText("Same folder as each source image")
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self.browse_output)
+        output_row = QHBoxLayout()
+        output_row.addWidget(self.output_edit)
+        output_row.addWidget(browse)
+        self.suffix_edit = QLineEdit("_converted")
+        self.overwrite_check = QCheckBox("Overwrite an existing converted file")
+        self.metadata_check = QCheckBox("Preserve metadata and color profile")
+        self.metadata_check.setChecked(True)
+        self.background_combo = QComboBox()
+        self.background_combo.addItems(["white", "black"])
+        form.addRow("Format", self.format_combo)
+        form.addRow("Quality", self.quality_spin)
+        form.addRow("PNG compression", self.png_spin)
+        form.addRow("Output folder", output_row)
+        form.addRow("Filename suffix", self.suffix_edit)
+        form.addRow("Transparency background", self.background_combo)
+        form.addRow("", self.metadata_check)
+        form.addRow("", self.overwrite_check)
+        layout.addLayout(form)
+        source_size = sum(path.stat().st_size for path in self.sources)
+        self.size_label = QLabel(f"Current total: {format_file_size(source_size)}  |  Estimated: calculating...")
+        layout.addWidget(self.size_label)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Convert")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._source_size = source_size
+        for widget in (self.format_combo, self.quality_spin, self.png_spin, self.background_combo):
+            signal = widget.currentTextChanged if isinstance(widget, QComboBox) else widget.valueChanged
+            signal.connect(self.schedule_estimate)
+        self.schedule_estimate()
+
+    def browse_output(self):
+        folder = QFileDialog.getExistingDirectory(self, "Output Folder", str(self.sources[0].parent))
+        if folder:
+            self.output_edit.setText(folder)
+
+    def schedule_estimate(self, *_args):
+        self.estimate_generation += 1
+        generation = self.estimate_generation
+        target_format, _extension = CONVERT_FORMATS[self.format_combo.currentText()]
+        self.quality_spin.setEnabled(target_format in ("JPEG", "WEBP", "AVIF"))
+        self.png_spin.setEnabled(target_format == "PNG")
+        self.background_combo.setEnabled(target_format in ("JPEG", "BMP"))
+        self.size_label.setText(f"Current total: {format_file_size(self._source_size)}  |  Estimated: calculating...")
+        task = ImageEstimateTask(
+            generation, self.sources, target_format, self.quality_spin.value(),
+            self.png_spin.value(), self.background_combo.currentText(),
+        )
+        self.estimate_refs.add(task)
+        task.signals.finished.connect(
+            lambda token, payload, ref=task: self.estimate_finished(token, payload, ref),
+            Qt.QueuedConnection,
+        )
+        self.estimate_pool.clear()
+        self.estimate_pool.start(task)
+
+    def estimate_finished(self, generation, payload, task):
+        self.estimate_refs.discard(task)
+        if generation != self.estimate_generation:
+            return
+        encoded, error = payload.split("|", 1)
+        estimate = "unavailable" if error else format_file_size(int(encoded))
+        sample = " (sampled)" if len(self.sources) > 8 and not error else ""
+        self.size_label.setText(
+            f"Current total: {format_file_size(self._source_size)}  |  Estimated: {estimate}{sample}"
+        )
+
+    def options(self):
+        target_format, extension = CONVERT_FORMATS[self.format_combo.currentText()]
+        return {
+            "format": target_format, "extension": extension,
+            "quality": self.quality_spin.value(), "png_compress": self.png_spin.value(),
+            "output_dir": self.output_edit.text().strip(), "suffix": self.suffix_edit.text(),
+            "overwrite": self.overwrite_check.isChecked(),
+            "preserve_metadata": self.metadata_check.isChecked(),
+            "background": self.background_combo.currentText(),
+        }
+
+
+class PermanentRotationDialog(QDialog):
+    def __init__(self, count, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Rotate Image Permanently")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"{count} image(s) will be overwritten permanently.\n"
+            "The original files cannot be restored by Undo."
+        ))
+        form = QFormLayout()
+        self.direction = QComboBox()
+        self.direction.addItem("Left 90°", 90)
+        self.direction.addItem("Right 90°", -90)
+        self.direction.addItem("180°", 180)
+        form.addRow("Direction", self.direction)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Rotate && Overwrite")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def angle(self):
+        return int(self.direction.currentData())
 
 
 class VlcInitSignals(QObject):
@@ -6958,6 +7394,11 @@ class MainWindow(QMainWindow):
         self.file_op_pool.setMaxThreadCount(1)
         self.file_op_pool.setThreadPriority(QThread.LowPriority)
         self.file_op_task_refs = set()
+        self.image_transform_pool = QThreadPool(self)
+        self.image_transform_pool.setMaxThreadCount(1)
+        self.image_transform_pool.setThreadPriority(QThread.LowPriority)
+        self.image_transform_task_refs = set()
+        self.image_transform_progress = None
         self.thumbnail_idle_cursor = 0
         self.thumbnail_task_refs = set()
         self.thumbnail_queue = deque()
@@ -7555,6 +7996,8 @@ class MainWindow(QMainWindow):
             "forward": self.go_forward,
             "rename": self.rename_selected,
             "delete": self.handle_delete_shortcut,
+            "convert_format": self.open_format_conversion,
+            "rotate_image_permanent": self.open_permanent_rotation,
         }
         for name, callback in shortcut_map.items():
             for seq in self.settings.get("shortcuts", {}).get(name, []):
@@ -9660,12 +10103,85 @@ class MainWindow(QMainWindow):
             return
         os.startfile(str(path))
 
-    def list_menu(self, pos):
-        item = self.list.itemAt(pos)
-        if item:
-            self.list.setCurrentItem(item)
+    def _selected_transform_images(self):
+        return eligible_transform_paths(self.selected_paths())
+
+    def open_format_conversion(self):
+        sources = self._selected_transform_images()
+        if not sources:
+            QMessageBox.information(self, "Convert Format", "Select one or more image files first.")
+            return
+        dialog = FormatConversionDialog(sources, self)
+        if dialog.exec() == QDialog.Accepted:
+            self._start_image_transform("convert", sources, **dialog.options())
+
+    def open_permanent_rotation(self):
+        sources = self._selected_transform_images()
+        if not sources:
+            QMessageBox.information(self, "Rotate Image", "Select one or more image files first.")
+            return
+        dialog = PermanentRotationDialog(len(sources), self)
+        if dialog.exec() == QDialog.Accepted:
+            self._start_image_transform("rotate", sources, angle=dialog.angle())
+
+    def _start_image_transform(self, operation, sources, **options):
+        if self.image_transform_task_refs:
+            QMessageBox.information(self, "Image Operation", "Another image operation is still running.")
+            return
+        task = ImageTransformTask(operation, sources, **options)
+        self.image_transform_task_refs.add(task)
+        title = "Converting images..." if operation == "convert" else "Rotating images..."
+        progress = QProgressDialog(title, "Cancel", 0, len(sources), self)
+        progress.setWindowTitle("Image Operation")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.canceled.connect(task.cancel)
+        task.signals.progress.connect(
+            lambda done, total, name: self._image_transform_progress(done, total, name),
+            Qt.QueuedConnection,
+        )
+        task.signals.finished.connect(
+            lambda result, ref=task: self._image_transform_finished(result, ref),
+            Qt.QueuedConnection,
+        )
+        self.image_transform_progress = progress
+        self.image_transform_pool.start(task)
+
+    def _image_transform_progress(self, done, total, name):
+        progress = self.image_transform_progress
+        if progress is not None:
+            progress.setMaximum(total)
+            progress.setLabelText(name)
+            progress.setValue(done)
+
+    def _image_transform_finished(self, result, task):
+        self.image_transform_task_refs.discard(task)
+        progress = self.image_transform_progress
+        self.image_transform_progress = None
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
+        self.invalidate_folder_cache()
+        self.reload_current_if_available()
+        completed = result.get("completed", [])
+        errors = result.get("errors", [])
+        if errors:
+            details = "\n".join(errors[:8])
+            if len(errors) > 8:
+                details += f"\n... and {len(errors) - 8} more"
+            QMessageBox.warning(
+                self, "Image Operation",
+                f"Completed: {len(completed)}\nFailed: {len(errors)}\n\n{details}",
+            )
+        elif result.get("cancelled"):
+            QMessageBox.information(self, "Image Operation", f"Cancelled. Completed: {len(completed)}")
+        else:
+            QMessageBox.information(self, "Image Operation", f"Completed: {len(completed)}")
+
+    def build_file_context_menu(self, path):
+        path = Path(path)
         menu = QMenu(self)
-        path = self.selected_primary_path()
         menu.addAction("Open Viewer (&V)", self.open_selected_viewer)
         if path.is_dir():
             menu.addAction("Add Shortcut (&S)", lambda p=path: self.add_quick_path(str(p)))
@@ -9680,30 +10196,35 @@ class MainWindow(QMainWindow):
         menu.addAction("Rename (&M)", self.rename_selected)
         menu.addAction("Delete (&D)", self.delete_selected)
         menu.addSeparator()
+        transform_paths = self._selected_transform_images()
+        convert_action = menu.addAction("Convert Format... (&F)", self.open_format_conversion)
+        rotate_action = menu.addAction("Rotate Image... (&O)", self.open_permanent_rotation)
+        convert_action.setEnabled(bool(transform_paths))
+        rotate_action.setEnabled(bool(transform_paths))
+        convert_sequences = self.settings.get("shortcuts", {}).get("convert_format", [])
+        rotate_sequences = self.settings.get("shortcuts", {}).get("rotate_image_permanent", [])
+        if convert_sequences:
+            convert_action.setShortcut(QKeySequence(convert_sequences[0]))
+        if rotate_sequences:
+            rotate_action.setShortcut(QKeySequence(rotate_sequences[0]))
+        menu.addSeparator()
         menu.addAction("Properties (&R)", lambda p=path: self.show_properties(p))
+        return menu
+
+    def list_menu(self, pos):
+        item = self.list.itemAt(pos)
+        if item and not item.isSelected():
+            self.list.setCurrentItem(item)
+        path = self.selected_primary_path()
+        menu = self.build_file_context_menu(path)
         menu.exec(self.list.mapToGlobal(pos))
 
     def details_menu(self, pos):
         item = self.details.itemAt(pos)
-        if item:
+        if item and not item.isSelected():
             self.details.selectRow(item.row())
-        menu = QMenu(self)
         path = self.selected_primary_path()
-        menu.addAction("Open Viewer (&V)", self.open_selected_viewer)
-        if path.is_dir():
-            menu.addAction("Add Shortcut (&S)", lambda p=path: self.add_quick_path(str(p)))
-        menu.addSeparator()
-        menu.addAction("Open in Windows (&E)", lambda p=path: self.open_in_explorer(p))
-        menu.addSeparator()
-        menu.addAction("New Folder (&N)", self.new_folder)
-        menu.addSeparator()
-        menu.addAction("Cut (&T)", lambda: self.cut_paths(self.selected_paths()))
-        menu.addAction("Copy (&C)", self.copy_selected)
-        menu.addAction("Paste (&P)", self.paste_from_clipboard)
-        menu.addAction("Rename (&M)", self.rename_selected)
-        menu.addAction("Delete (&D)", self.delete_selected)
-        menu.addSeparator()
-        menu.addAction("Properties (&R)", lambda p=path: self.show_properties(p))
+        menu = self.build_file_context_menu(path)
         menu.exec(self.details.mapToGlobal(pos))
 
     def tree_menu(self, pos):
@@ -9759,6 +10280,8 @@ class MainWindow(QMainWindow):
         self.unc_share_task_refs.clear()
         for task in list(getattr(self, "file_op_task_refs", set())):
             task.cancel()
+        for task in list(getattr(self, "image_transform_task_refs", set())):
+            task.cancel()
         if hasattr(self, "settings_save_timer") and self.settings_save_timer.isActive():
             self.settings_save_timer.stop()
             save_settings(self.settings)
@@ -9771,6 +10294,7 @@ class MainWindow(QMainWindow):
             getattr(self, "thumbnail_pool", None),
             getattr(self, "archive_pool", None),
             getattr(self, "file_op_pool", None),
+            getattr(self, "image_transform_pool", None),
         ):
             if pool is not None:
                 pool.clear()

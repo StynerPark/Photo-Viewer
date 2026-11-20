@@ -42,6 +42,8 @@
     "back": ["Alt+Left"],
     "forward": ["Alt+Right"],
     "rename": ["F2"],
-    "delete": ["Delete"]
+    "delete": ["Delete"],
+    "convert_format": ["Ctrl+Shift+F"],
+    "rotate_image_permanent": ["Ctrl+Shift+R"]
   }
 }

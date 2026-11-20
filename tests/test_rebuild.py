@@ -2932,6 +2932,61 @@ class RebuildTests(unittest.TestCase):
             window.folder_scan_pool.waitForDone(5000)
             window.thumbnail_pool.waitForDone(5000)
 
+    def test_convert_and_permanent_rotate_use_real_files(self):
+        source = self.root / "alpha.png"
+        image = Image.new("RGBA", (4, 2), (255, 0, 0, 128))
+        image.putpixel((3, 1), (0, 255, 0, 255))
+        image.save(source)
+        converted = self.root / "alpha_converted.jpg"
+
+        main.atomic_convert_image(source, converted, "JPEG", quality=88, background="white")
+        self.assertTrue(converted.exists())
+        with Image.open(converted) as check:
+            self.assertEqual(check.size, (4, 2))
+            self.assertEqual(check.mode, "RGB")
+
+        main.atomic_rotate_image(source, -90)
+        with Image.open(source) as check:
+            self.assertEqual(check.size, (2, 4))
+
+    def test_failed_conversion_leaves_source_and_no_temporary_file(self):
+        source = self.root / "source.png"
+        Image.new("RGB", (8, 6), (20, 30, 40)).save(source)
+        before = source.read_bytes()
+        destination = self.root / "result.jpg"
+        with mock.patch.object(main, "_save_with_metadata_fallback", side_effect=OSError("encode failed")):
+            with self.assertRaises(OSError):
+                main.atomic_convert_image(source, destination, "JPEG")
+        self.assertEqual(source.read_bytes(), before)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.root.glob(".result_*")), [])
+
+    def test_animated_image_is_not_flattened_by_file_operations(self):
+        animated = self.make_animated_gif(self.root / "animated.gif", frame_count=2)
+        with self.assertRaisesRegex(ValueError, "Animated"):
+            main.atomic_convert_image(animated, self.root / "flattened.png", "PNG")
+        with self.assertRaisesRegex(ValueError, "Animated"):
+            main.atomic_rotate_image(animated, 90)
+
+    def test_file_context_menu_places_shortcut_actions_between_delete_and_properties(self):
+        image_path = self.root / "menu.jpg"
+        Image.new("RGB", (10, 10), (1, 2, 3)).save(image_path)
+        with mock.patch.object(main, "SETTINGS_PATH", self.root / "settings.json"):
+            window = main.MainWindow(self.root)
+            window.selected_paths = lambda: [image_path]
+            menu = window.build_file_context_menu(image_path)
+            actions = menu.actions()
+            labels = [action.text() if not action.isSeparator() else "---" for action in actions]
+            delete_index = labels.index("Delete (&D)")
+            properties_index = labels.index("Properties (&R)")
+            self.assertEqual(
+                labels[delete_index:properties_index + 1],
+                ["Delete (&D)", "---", "Convert Format... (&F)", "Rotate Image... (&O)", "---", "Properties (&R)"],
+            )
+            self.assertEqual(actions[delete_index + 2].shortcut().toString(), "Ctrl+Shift+F")
+            self.assertEqual(actions[delete_index + 3].shortcut().toString(), "Ctrl+Shift+R")
+            window.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

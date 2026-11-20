@@ -1,5 +1,5 @@
 #define AppName "Photo Viewer"
-#define AppVersion "2.0.0"
+#define AppVersion "2.0.1"
 #define AppExeName "PhotoViewer.exe"
 #define ProgId "PhotoViewer.Image"
 #define SourceDir "..\dist\PhotoViewer"
@@ -12,8 +12,8 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} v{#AppVersion}
 AppPublisher={#AppName}
-VersionInfoVersion=2.0.0.0
-VersionInfoProductVersion=2.0.0.0
+VersionInfoVersion=2.0.1.0
+VersionInfoProductVersion=2.0.1.0
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
@@ -35,7 +35,7 @@ SetupIconFile={#SourceRoot}\app.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName} v{#AppVersion}
 OutputDir={#OutputDir}
-OutputBaseFilename=PhotoViewer_v2.0.0_Setup
+OutputBaseFilename=PhotoViewer_v2.0.1_Setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 CloseApplications=yes
@@ -53,7 +53,7 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "settings.json"; Flags: ig
 Source: "{#SourceRoot}\settings.example.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\INSTALLER_BUILD_v2.0.0.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\INSTALLER_BUILD_v2.0.1.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"

@@ -11,6 +11,46 @@ DIST = ROOT / "dist" / "PhotoViewer"
 SPEC_FILE = ROOT / "PhotoViewer.spec"
 
 
+def sync_qt_msvc_runtime(dist_dir):
+    """Keep Qt's required MSVC runtime ahead of Python's older bundled copy."""
+    internal = dist_dir / "_internal"
+    pyside = internal / "PySide6"
+    names = (
+        "VCRUNTIME140.dll",
+        "VCRUNTIME140_1.dll",
+        "MSVCP140.dll",
+        "MSVCP140_1.dll",
+        "MSVCP140_2.dll",
+        "msvcp140_atomic_wait.dll",
+    )
+    copied = []
+    for name in names:
+        source = pyside / name
+        if source.exists():
+            target = internal / name
+            shutil.copy2(source, target)
+            copied.append(target)
+    if not copied:
+        raise RuntimeError(f"PySide6 MSVC runtime was not found under {pyside}")
+    return copied
+
+
+def remove_foreign_icu_runtime(dist_dir):
+    """Do not ship ICU DLLs accidentally collected from tools on build PATH.
+
+    Qt 6 on Windows links against the Windows ICU forwarding DLL. A Poppler
+    or other third-party ICU build exports version-suffixed symbols instead
+    and causes QtCore to fail with ERROR_PROC_NOT_FOUND on a clean launch.
+    """
+    internal = dist_dir / "_internal"
+    removed = []
+    for pattern in ("icuuc.dll", "icudt*.dll", "icuin*.dll"):
+        for path in internal.glob(pattern):
+            path.unlink()
+            removed.append(path)
+    return removed
+
+
 def locate_vlc_source():
     configured = os.environ.get("PHOTO_VIEWER_VLC_SOURCE", "").strip()
     candidates = [Path(configured)] if configured else []
@@ -57,6 +97,10 @@ def main():
             "--clean",
             str(SPEC_FILE),
         ], cwd=ROOT)
+        for runtime in sync_qt_msvc_runtime(DIST):
+            print(runtime)
+        for runtime in remove_foreign_icu_runtime(DIST):
+            print(f"removed incompatible ICU: {runtime}")
         if vlc_source is not None:
             target = DIST / "vlc"
             if target.exists():
