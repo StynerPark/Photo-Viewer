@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 LEGACY_APP_NAME = "Portable Photo Viewer"
 INSTANCE_SERVER_NAME = "StynerPark_PhotoViewer_Instance"
 DEFAULT_LAST_FOLDER_SETTING = r"%USERPROFILE%\Documents"
@@ -46,6 +46,7 @@ def migrate_legacy_settings(settings_path=None, local_appdata=None):
         local_appdata = os.environ.get("LOCALAPPDATA")
     settings_root = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
     legacy_candidates = (
+        settings_root / APP_NAME / "2.0.1" / "settings.json",
         settings_root / APP_NAME / "2.0.0" / "settings.json",
         settings_root / APP_NAME / "settings.json",
         settings_root / LEGACY_APP_NAME / "settings.json",
@@ -5010,6 +5011,16 @@ class ViewerWindow(QMainWindow):
 
         self.central.setUpdatesEnabled(False)
         self.clear_grid()
+        animation_workers = max(1, int(self.performance_policy.animation_workers))
+        if prepared_items:
+            visible_animations = sum(1 for item in prepared_items if item.get("animated"))
+            # Each AnimatedImageTask owns a worker for its whole playback
+            # lifetime.  A FAST profile limit of two therefore left the third
+            # GIF in triple-page mode queued forever.  Preserve the selected
+            # profile everywhere else, but guarantee one worker per visible
+            # animated slot (the viewer exposes at most three slots).
+            animation_workers = max(animation_workers, min(3, visible_animations))
+        self.animated_image_pool.setMaxThreadCount(animation_workers)
         if not group:
             label = QLabel("No media")
             label.setAlignment(Qt.AlignCenter)
@@ -6393,6 +6404,7 @@ class ViewerWindow(QMainWindow):
     def update_webtoon_visible_images(self, generation=None):
         if generation is not None and generation != self.render_generation:
             return
+        decode_request = (self.render_generation, self.image_update_token)
         margin = 4 if self.webtoon_auto_scroll_active else 2
         visible = set(
             self.visible_webtoon_indices(
@@ -6404,9 +6416,9 @@ class ViewerWindow(QMainWindow):
             if idx in self.webtoon_loaded:
                 continue
             label, path = self.labels[idx]
-            if label.property("decode_generation") == self.render_generation:
+            if label.property("decode_generation") == decode_request:
                 continue
-            label.setProperty("decode_generation", self.render_generation)
+            label.setProperty("decode_generation", decode_request)
             self.queue_viewer_decode(label, path, self.render_generation, priority=10)
 
     def release_offscreen_webtoon_pixmaps(self, visible=None):
@@ -6450,14 +6462,15 @@ class ViewerWindow(QMainWindow):
             int(self.performance_policy.webtoon_lookahead) + 1,
         )
         visible = set(self.visible_webtoon_indices(margin=visible_margin))
+        decode_request = (self.render_generation, self.image_update_token)
         for _ in range(len(self.labels)):
             idx = self.webtoon_idle_index % len(self.labels)
             self.webtoon_idle_index += 1
             if idx in self.webtoon_loaded or idx in visible:
                 continue
             label, path = self.labels[idx]
-            if label.property("decode_generation") != self.render_generation:
-                label.setProperty("decode_generation", self.render_generation)
+            if label.property("decode_generation") != decode_request:
+                label.setProperty("decode_generation", decode_request)
                 self.queue_viewer_decode(label, path, self.render_generation, priority=-10, preload=True)
             break
         if len(self.webtoon_loaded) >= len(self.labels):

@@ -29,6 +29,23 @@ class InstallerCleanReinstallTests(unittest.TestCase):
         self.assertIn("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART", self.script)
         self.assertIn("ewWaitUntilTerminated", self.script)
 
+    def test_missing_uninstaller_is_treated_as_orphan_and_never_blocks_reinstall(self):
+        start = self.script.index("if (Uninstaller = '') or (not FileExists(Uninstaller)) then")
+        end = self.script.index("Parameters := '/VERYSILENT", start)
+        orphan_branch = self.script[start:end]
+        self.assertIn("RegDeleteKeyIncludingSubkeys(Root, RegistryKey)", orphan_branch)
+        self.assertIn("installation will continue", orphan_branch)
+        self.assertNotIn("Result := False", orphan_branch)
+        self.assertNotIn("FailureMessage :=", orphan_branch)
+
+    def test_leftover_registry_key_after_successful_uninstall_does_not_block(self):
+        marker = "if RegKeyExists(Root, RegistryKey) then"
+        start = self.script.index(marker, self.script.index("function RunRegisteredUninstaller"))
+        end = self.script.index("end;", start) + len("end;")
+        leftover_branch = self.script[start:end]
+        self.assertIn("RegDeleteKeyIncludingSubkeys(Root, RegistryKey)", leftover_branch)
+        self.assertNotIn("Result := False", leftover_branch)
+
 
 if __name__ == "__main__":
     unittest.main()

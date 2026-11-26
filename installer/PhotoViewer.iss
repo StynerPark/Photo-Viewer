@@ -1,5 +1,5 @@
 #define AppName "Photo Viewer"
-#define AppVersion "2.0.1"
+#define AppVersion "2.0.2"
 #define AppExeName "PhotoViewer.exe"
 #define ProgId "PhotoViewer.Image"
 #define SourceDir "..\dist\PhotoViewer"
@@ -12,8 +12,8 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} v{#AppVersion}
 AppPublisher={#AppName}
-VersionInfoVersion=2.0.1.0
-VersionInfoProductVersion=2.0.1.0
+VersionInfoVersion=2.0.2.0
+VersionInfoProductVersion=2.0.2.0
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
@@ -35,7 +35,7 @@ SetupIconFile={#SourceRoot}\app.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName} v{#AppVersion}
 OutputDir={#OutputDir}
-OutputBaseFilename=PhotoViewer_v2.0.1_Setup
+OutputBaseFilename=PhotoViewer_v2.0.2_Setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 CloseApplications=yes
@@ -53,7 +53,7 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "settings.json"; Flags: ig
 Source: "{#SourceRoot}\settings.example.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\INSTALLER_BUILD_v2.0.1.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\INSTALLER_BUILD_v2.0.2.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
@@ -285,10 +285,14 @@ begin
   Uninstaller := ExtractUninstallExecutable(CommandLine);
   if (Uninstaller = '') or (not FileExists(Uninstaller)) then
   begin
-    FailureMessage :=
-      '기존 Photo Viewer 제거 프로그램을 찾을 수 없습니다.' + #13#10 +
-      RegistryKey;
-    Result := False;
+    { A manually removed program can leave only its uninstall registry key.
+      That orphan must never prevent a clean reinstall. The explicit AppIds
+      and display-name filter ensure this routine only handles our product. }
+    Log(Format('Ignoring orphaned Photo Viewer uninstall entry (uninstaller missing): %s', [RegistryKey]));
+    if RegDeleteKeyIncludingSubkeys(Root, RegistryKey) then
+      Log(Format('Removed orphaned uninstall entry: %s', [RegistryKey]))
+    else
+      Log(Format('Could not remove orphaned uninstall entry; installation will continue: %s', [RegistryKey]));
     exit;
   end;
 
@@ -321,10 +325,13 @@ begin
 
   if RegKeyExists(Root, RegistryKey) then
   begin
-    FailureMessage :=
-      '기존 Photo Viewer 설치 정보가 제거 후에도 남아 있습니다.' + #13#10 +
-      'PC를 다시 시작한 뒤 설치 파일을 다시 실행해 주세요.';
-    Result := False;
+    { Exit code 0 means the uninstaller completed. A leftover key is stale
+      metadata, not a reason to block the requested reinstall. }
+    Log(Format('Uninstaller completed but its registry entry remains: %s', [RegistryKey]));
+    if RegDeleteKeyIncludingSubkeys(Root, RegistryKey) then
+      Log(Format('Removed leftover uninstall entry: %s', [RegistryKey]))
+    else
+      Log(Format('Could not remove leftover uninstall entry; installation will continue: %s', [RegistryKey]));
   end;
 end;
 

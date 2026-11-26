@@ -493,6 +493,46 @@ class RebuildTests(unittest.TestCase):
         viewer.decode_pool.waitForDone(5000)
         viewer.preload_decode_pool.waitForDone(5000)
 
+    def test_webtoon_plus_and_minus_redraw_at_the_new_width(self):
+        path = self.root / "webtoon_zoom.jpg"
+        Image.new("RGB", (900, 1800), (45, 90, 150)).save(path, quality=85)
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["default_viewer_mode"] = "webtoon"
+        viewer = main.ViewerWindow(settings)
+        viewer.viewer_mode = "webtoon_vertical"
+        viewer.resize(1000, 720)
+        viewer.show()
+        viewer.load([path], 0)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not viewer.webtoon_loaded:
+            self.app.processEvents()
+            time.sleep(0.002)
+        self.assertTrue(viewer.webtoon_loaded)
+        initial_width = viewer.labels[0][0].width()
+
+        plus = QKeyEvent(QEvent.KeyPress, Qt.Key_Plus, Qt.ShiftModifier, "+")
+        viewer.keyPressEvent(plus)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and viewer.labels[0][0].width() <= initial_width:
+            self.app.processEvents()
+            time.sleep(0.002)
+        enlarged_width = viewer.labels[0][0].width()
+        self.assertGreater(enlarged_width, initial_width)
+
+        minus = QKeyEvent(QEvent.KeyPress, Qt.Key_Minus, Qt.NoModifier, "-")
+        viewer.keyPressEvent(minus)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and viewer.labels[0][0].width() >= enlarged_width:
+            self.app.processEvents()
+            time.sleep(0.002)
+        self.assertLess(viewer.labels[0][0].width(), enlarged_width)
+
+        viewer.deactivate()
+        viewer.close()
+        viewer.decode_pool.waitForDone(5000)
+        viewer.preload_decode_pool.waitForDone(5000)
+
     def test_animated_gif_decodes_off_ui_thread_and_cancels_on_exit(self):
         gif = self.make_animated_gif(self.root / "animated.gif")
         viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
@@ -620,7 +660,9 @@ class RebuildTests(unittest.TestCase):
 
     def test_triple_animated_images_use_distinct_bounded_workers(self):
         gifs = [self.make_animated_gif(self.root / f"triple_{index}.gif", frame_count=6, size=(180, 120)) for index in range(3)]
-        viewer = main.ViewerWindow(copy.deepcopy(main.DEFAULT_SETTINGS))
+        settings = copy.deepcopy(main.DEFAULT_SETTINGS)
+        settings["performance_profile"] = "fast"
+        viewer = main.ViewerWindow(settings)
         viewer.resize(1200, 700)
         viewer.viewer_mode = "triple"
         viewer.step_mode = "page"
@@ -638,7 +680,17 @@ class RebuildTests(unittest.TestCase):
         self.assertEqual(len(states), 3)
         self.assertTrue(all(state.get("has_frame") for state in states))
         self.assertEqual(len({state.get("token") for state in states}), 3)
-        self.assertLessEqual(viewer.animated_image_pool.maxThreadCount(), 3)
+        self.assertEqual(viewer.animated_image_pool.maxThreadCount(), 3)
+        initial_indices = {state["path"].name: state.get("index") for state in states}
+        moved = set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(moved) < 3:
+            self.app.processEvents()
+            for state in viewer.animated_image_states.values():
+                if state.get("index") != initial_indices.get(state["path"].name):
+                    moved.add(state["path"].name)
+            time.sleep(0.002)
+        self.assertEqual(moved, {path.name for path in gifs})
         viewer.deactivate()
         viewer.close()
         viewer.animated_image_pool.waitForDone(5000)

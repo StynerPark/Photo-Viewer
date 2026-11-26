@@ -1,4 +1,4 @@
-# Photo Viewer v2.0.1
+# Photo Viewer v2.0.2
 
 Photo Viewer는 Windows용 이미지·영상 뷰어이자 폴더 탐색기입니다. 로컬 및 SMB/UNC 폴더 탐색, 단일·2장·3장·웹툰 보기, 애니메이션 이미지, VLC 기반 영상 재생을 지원합니다.
 
@@ -6,10 +6,19 @@ Photo Viewer는 Windows용 이미지·영상 뷰어이자 폴더 탐색기입니
 
 최신 설치 파일은 [GitHub Releases](https://github.com/StynerPark/Photo-Viewer/releases/latest)에서 받을 수 있습니다.
 
-- 설치 파일: `PhotoViewer_v2.0.1_Setup.exe`
+- 설치 파일: `PhotoViewer_v2.0.2_Setup.exe`
 - 이전 등록 정리 도구: `PhotoViewer_DefaultApp_Reset_v1.0.8.exe`
 - Windows 10/11 x64
 - 현재 배포 파일은 코드 서명이 없으므로 Windows SmartScreen 안내가 표시될 수 있습니다.
+
+## v2.0.2 핵심 변경
+
+- 프로그램 폴더를 수동 삭제해 제거 EXE가 없고 레지스트리만 남은 상태에서도 새 설치를 계속합니다.
+- Photo Viewer의 확실한 앱 ID 또는 표시 이름으로 확인된 고아 제거 정보만 정리를 시도합니다.
+- 권한 때문에 다른 설치 범위의 고아 키를 지우지 못하더라도 사용자가 선택한 범위의 설치는 막지 않습니다.
+- 실제 제거 프로그램 실행 실패나 비정상 종료는 기존처럼 중단해 파일 잠금과 불완전 덮어쓰기를 방지합니다.
+- 웹툰 보기에서 `+`/`-` 확대·축소 후 보이는 이미지가 새 배율로 다시 그려지지 않던 문제를 수정했습니다.
+- FAST 성능 설정에서도 트리플 모드의 GIF 세 장이 모두 동시에 재생되도록 보이는 애니메이션 슬롯 수만큼 작업자를 확보합니다.
 
 ## v2.0.1 핵심 변경
 
