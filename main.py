@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 LEGACY_APP_NAME = "Portable Photo Viewer"
 INSTANCE_SERVER_NAME = "StynerPark_PhotoViewer_Instance"
 DEFAULT_LAST_FOLDER_SETTING = r"%USERPROFILE%\Documents"
@@ -46,6 +46,7 @@ def migrate_legacy_settings(settings_path=None, local_appdata=None):
         local_appdata = os.environ.get("LOCALAPPDATA")
     settings_root = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
     legacy_candidates = (
+        settings_root / APP_NAME / "2.0.2" / "settings.json",
         settings_root / APP_NAME / "2.0.1" / "settings.json",
         settings_root / APP_NAME / "2.0.0" / "settings.json",
         settings_root / APP_NAME / "settings.json",
@@ -7418,6 +7419,7 @@ class MainWindow(QMainWindow):
         self.thumbnail_queue_set = set()
         self.thumbnail_cycle_started = False
         self.generic_media_icon = None
+        self.generic_folder_icon = None
         self.entry_by_path = {}
         self.view_render_keys = {"list": None, "details": None}
         self.explorer_render_pending = False
@@ -8346,7 +8348,12 @@ class MainWindow(QMainWindow):
         self.schedule_settings_save()
         self.path_edit.setText(self.display_path)
         self.watch_current_folder()
-        if sync_tree:
+        # QFileSystemModel.index() resolves each component of a UNC path on the
+        # GUI thread.  Across SMB/Tailscale that delayed tree selection can
+        # freeze the otherwise asynchronous folder open for hundreds of
+        # milliseconds or several seconds.  The address bar and list remain
+        # authoritative for UNC locations; keep the local tree sync unchanged.
+        if sync_tree and not str(folder).startswith("\\\\"):
             self.pending_tree_path = str(folder)
             self.tree_sync_timer.start(180)
         else:
@@ -8726,6 +8733,13 @@ class MainWindow(QMainWindow):
         cached = self.thumbnail_cache.get(path)
         if cached is not None and self.thumbnail_cache_meta.get(path) == (entry.size, entry.mtime):
             return cached
+        if entry.is_dir and path.startswith("\\\\"):
+            # QFileIconProvider asks the Windows shell about every directory.
+            # On a high-latency UNC share this serial round-trip dominated the
+            # first paint even though all entries use the same folder artwork.
+            if self.generic_folder_icon is None:
+                self.generic_folder_icon = self.style().standardIcon(QStyle.SP_DirIcon)
+            return self.generic_folder_icon
         if lightweight:
             if entry.is_dir:
                 return self.icon_provider.icon(QFileInfo(path))

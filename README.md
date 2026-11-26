@@ -1,4 +1,4 @@
-# Photo Viewer v2.0.2
+# Photo Viewer v2.0.3
 
 Photo Viewer는 Windows용 이미지·영상 뷰어이자 폴더 탐색기입니다. 로컬 및 SMB/UNC 폴더 탐색, 단일·2장·3장·웹툰 보기, 애니메이션 이미지, VLC 기반 영상 재생을 지원합니다.
 
@@ -6,10 +6,16 @@ Photo Viewer는 Windows용 이미지·영상 뷰어이자 폴더 탐색기입니
 
 최신 설치 파일은 [GitHub Releases](https://github.com/StynerPark/Photo-Viewer/releases/latest)에서 받을 수 있습니다.
 
-- 설치 파일: `PhotoViewer_v2.0.2_Setup.exe`
+- 설치 파일: `PhotoViewer_v2.0.3_Setup.exe`
 - 이전 등록 정리 도구: `PhotoViewer_DefaultApp_Reset_v1.0.8.exe`
 - Windows 10/11 x64
 - 현재 배포 파일은 코드 서명이 없으므로 Windows SmartScreen 안내가 표시될 수 있습니다.
+
+## v2.0.3 핵심 변경
+
+- SMB/Tailscale UNC 폴더를 열 때 네트워크 경로의 좌측 트리 자동 선택을 생략해 UI 스레드 정지를 제거했습니다.
+- UNC 하위 폴더 목록은 동일한 공용 폴더 아이콘을 재사용해 Windows 셸의 폴더별 네트워크 조회를 피합니다.
+- 로컬 폴더의 트리 자동 선택, 개별 아이콘, UI 구성과 메뉴는 기존과 동일합니다.
 
 ## v2.0.2 핵심 변경
 

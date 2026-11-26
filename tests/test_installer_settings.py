@@ -6,8 +6,8 @@ import main
 
 
 class InstallerSettingsTests(unittest.TestCase):
-    def test_version_is_2_0_2(self):
-        self.assertEqual(main.APP_VERSION, "2.0.2")
+    def test_version_is_2_0_3(self):
+        self.assertEqual(main.APP_VERSION, "2.0.3")
 
     def test_source_and_installed_builds_use_versioned_per_user_local_appdata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -34,10 +34,10 @@ class InstallerSettingsTests(unittest.TestCase):
             self.assertFalse(main.migrate_legacy_settings(target, local_appdata))
             self.assertEqual(target.read_text(encoding="utf-8"), '{"theme":"light"}')
 
-    def test_v2_0_1_settings_are_copied_without_removing_the_old_version(self):
+    def test_v2_0_2_settings_are_copied_without_removing_the_old_version(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             local_appdata = Path(temp_dir) / "Local"
-            old = local_appdata / main.APP_NAME / "2.0.1" / "settings.json"
+            old = local_appdata / main.APP_NAME / "2.0.2" / "settings.json"
             target = local_appdata / main.APP_NAME / main.APP_VERSION / "settings.json"
             old.parent.mkdir(parents=True)
             old.write_text('{"theme":"light","custom":17}', encoding="utf-8")

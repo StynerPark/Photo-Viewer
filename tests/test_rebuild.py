@@ -1470,6 +1470,31 @@ class RebuildTests(unittest.TestCase):
             window.folder_scan_pool.waitForDone(5000)
             window.thumbnail_pool.waitForDone(5000)
 
+    def test_unc_folder_open_skips_blocking_tree_sync_and_reuses_folder_icon(self):
+        window = main.MainWindow(self.root)
+        window.tree_sync_timer.stop()
+        unc_folder = Path(r"\\server\share\webtoon")
+        with (
+            mock.patch.object(window, "watch_current_folder"),
+            mock.patch.object(window, "populate_list"),
+            mock.patch.object(window, "update_current_tab"),
+            mock.patch.object(window, "schedule_settings_save"),
+        ):
+            self.assertTrue(window.load_folder(unc_folder))
+        self.assertEqual(window.pending_tree_path, "")
+        self.assertFalse(window.tree_sync_timer.isActive())
+
+        first = main.MediaItem(unc_folder / "one", is_dir=True)
+        second = main.MediaItem(unc_folder / "two", is_dir=True)
+        with mock.patch.object(window.icon_provider, "icon", side_effect=AssertionError("UNC shell icon lookup")):
+            first_icon = window.entry_icon(first, lightweight=True)
+            second_icon = window.entry_icon(second, lightweight=True)
+        self.assertFalse(first_icon.isNull())
+        self.assertEqual(first_icon.cacheKey(), second_icon.cacheKey())
+        window.close()
+        window.folder_scan_pool.waitForDone(5000)
+        window.thumbnail_pool.waitForDone(5000)
+
     def test_home_end_move_to_first_and_last_items(self):
         listing = main.ThumbList()
         for index in range(8):
